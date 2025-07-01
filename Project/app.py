@@ -1,18 +1,23 @@
 import os
 import re
 import json
-import sqlite3
 import requests
 from bs4 import BeautifulSoup
 import fitz  # PyMuPDF
 from flask import Flask, render_template, request, jsonify
 import google.generativeai as genai
+from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
 
-# The database path will be provided by an environment variable on the server.
-# We'll use a default for local development.
-DATABASE = os.environ.get('DATABASE_PATH', 'master.db')
+# Get the database connection string from environment variables
+# This is the secret key you got from Neon
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set. Please set it before running the app.")
+
+# Create a database engine
+engine = create_engine(DATABASE_URL)
 
 # Mapping products to their acronyms for two-way search
 PRODUCT_ACRONYM_MAP = {
@@ -30,16 +35,15 @@ PRODUCT_ACRONYM_MAP = {
 }
 
 # Configure Gemini API
-GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyDduuVQC0X8ugn8Srqhv7t5go5z6UEsVds")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise ValueError("GOOGLE_API_KEY is not set. Please set it before running the app.")
+    raise ValueError("GEMINI_API_KEY is not set. Please set it before running the app.")
 genai.configure(api_key=GEMINI_API_KEY)
 
 def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Establishes a connection to the PostgreSQL database."""
+    # The 'engine' manages connections, so we just use it directly
+    return engine.connect()
 
 def fetch_and_summarize_document(url):
     """Fetches content from a URL, extracts text from HTML or PDF, and summarizes it."""
@@ -74,7 +78,6 @@ def fetch_and_summarize_document(url):
         return f"Error fetching URL: {e}"
     except Exception as e:
         return f"An error occurred during processing: {e}"
-
 
 def llm_query_parsing(natural_language_query):
     """Uses Gemini to parse a natural language query into structured JSON."""
@@ -134,41 +137,46 @@ Return a single, valid JSON object.
 """
     try:
         response = model.generate_content(prompt)
-        extracted_info = json.loads(response.text.strip())
+        # Clean the response to ensure it's valid JSON
+        cleaned_text = response.text.strip().replace('```json', '').replace('```', '')
+        extracted_info = json.loads(cleaned_text)
         return extracted_info
     except Exception as e:
         print(f"Error calling Gemini API or parsing response: {e}")
         return {"product": None, "document_type": None, "keywords": natural_language_query.lower().split()}
 
 def build_sql_query_from_llm_output(extracted_info):
-    """Builds a SQL WHERE clause, now searching the new Generated_Keywords column."""
+    """Builds a SQL WHERE clause for PostgreSQL."""
     conditions = []
-    params = []
+    params = {}
     product = extracted_info.get("product")
     doc_type = extracted_info.get("document_type")
     keywords = extracted_info.get("keywords", [])
 
     if product:
-        product_conditions = ["Product LIKE ?"]
-        params.append(f"%{product}%")
+        product_conditions = ['"Product" ILIKE :product']
+        params['product'] = f"%{product}%"
         acronyms = PRODUCT_ACRONYM_MAP.get(product, [])
-        for acronym in acronyms:
-            product_conditions.append("Product LIKE ?")
-            params.append(f"%{acronym}%")
+        for i, acronym in enumerate(acronyms):
+            param_name = f"acronym_{i}"
+            product_conditions.append(f'"Product" ILIKE :{param_name}')
+            params[param_name] = f"%{acronym}%"
         conditions.append(f"({ ' OR '.join(product_conditions) })")
 
     if doc_type:
-        doc_type_keyword_condition = "(Content_Title LIKE ? OR Description LIKE ? OR Generated_Keywords LIKE ?)"
-        conditions.append(f"(Doc_type LIKE ? OR {doc_type_keyword_condition})")
-        params.extend([f"%{doc_type}%", f"%{doc_type}%", f"%{doc_type}%", f"%{doc_type}%"])
-    
-    for keyword in keywords:
-        # Now searches the new Generated_Keywords column as well
-        conditions.append("(Content_Title LIKE ? OR Description LIKE ? OR Generated_Keywords LIKE ?)")
-        params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+        doc_type_keyword_condition = '("Content_Title" ILIKE :doc_type OR "Description" ILIKE :doc_type OR "Generated_Keywords" ILIKE :doc_type)'
+        conditions.append(f'("Doc_type" ILIKE :doc_type OR {doc_type_keyword_condition})')
+        params['doc_type'] = f"%{doc_type}%"
+
+    for i, keyword in enumerate(keywords):
+        param_name = f"keyword_{i}"
+        conditions.append(f'("Content_Title" ILIKE :{param_name} OR "Description" ILIKE :{param_name} OR "Generated_Keywords" ILIKE :{param_name})')
+        params[param_name] = f"%{keyword}%"
 
     if not conditions:
-        return "", []
+        return "", {}
+    
+    # Note the double quotes around column names for PostgreSQL
     sql_where_clause = " AND ".join(conditions)
     return sql_where_clause, params
 
@@ -178,7 +186,7 @@ def index():
 
 @app.route('/search', methods=['POST'])
 def search():
-    """Handles the search query, queries the DB, and returns results without summarization."""
+    """Handles the search query, queries the DB, and returns results."""
     user_query = request.json.get('query', '')
     
     extracted_info = llm_query_parsing(user_query)
@@ -186,16 +194,17 @@ def search():
     
     results = []
     if sql_where_clause:
-        conn = get_db_connection()
         try:
-            query = f"SELECT Product, Doc_type, Content_Title, Description, Link FROM content_repo WHERE {sql_where_clause}"
-            cursor = conn.execute(query, params)
-            results = [dict(row) for row in cursor.fetchall()]
+            with get_db_connection() as conn:
+                # Note the double quotes for column names
+                query_string = f'SELECT "Product", "Doc_type", "Content_Title", "Description", "Link" FROM content_repo WHERE {sql_where_clause}'
+                query = text(query_string)
+                cursor = conn.execute(query, params)
+                # Convert results to a list of dictionaries
+                results = [dict(row._mapping) for row in cursor.fetchall()]
         except Exception as e:
             print(f"Database query error: {e}")
             return jsonify({"error": "An error occurred during the database query."}), 500
-        finally:
-            conn.close()
 
     return jsonify(results)
 
@@ -208,14 +217,13 @@ def summarize():
         return jsonify({'summary': 'No URL provided.'}), 400
 
     summary = ""
-    # **FIX:** Changed the check to be more general.
     if 'manageengine.com' in url:
         summary = fetch_and_summarize_document(url)
     elif 'workdrive' in url:
         summary = "This is an internal document and cannot be summarized."
     else:
-        # This case might not be needed if all links are one of the above.
         summary = "This link is not from a recognized domain for summarization."
         
     return jsonify({'summary': summary})
 
+# NOTE: The if __name__ == '__main__': block is removed as it's not needed for Gunicorn deployment
