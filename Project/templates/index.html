@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSM Content Repository</title>
+    <title>WSM Content Assistant</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -12,7 +12,7 @@
 <body>
     <div class="chat-container">
         <header class="app-header">
-            <h1>WSM Content Repository</h1>
+            <h1>WSM Content Assistant</h1>
         </header>
 
         <main id="chat-window" class="chat-window">
@@ -32,114 +32,123 @@
     </div>
 
     <script>
-        const queryInput = document.getElementById('queryInput');
-        const searchButton = document.getElementById('searchButton');
-        const chatWindow = document.getElementById('chat-window');
-        const chatContainer = document.querySelector('.chat-container');
+        document.addEventListener('DOMContentLoaded', () => {
+            const queryInput = document.getElementById('queryInput');
+            const searchButton = document.getElementById('searchButton');
+            const chatWindow = document.getElementById('chat-window');
+            const chatContainer = document.querySelector('.chat-container');
 
-        searchButton.addEventListener('click', performSearch);
-        queryInput.addEventListener('keypress', function(event) {
-            if (event.key === 'Enter') {
-                performSearch();
+            // --- CHAT HISTORY MEMORY ---
+            let chatHistory = [];
+
+            searchButton.addEventListener('click', performChat);
+            
+            queryInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    performChat();
+                }
+            });
+
+            function appendUserMessage(query) {
+                const userMessage = document.createElement('div');
+                userMessage.classList.add('chat-message', 'user-message');
+                userMessage.innerHTML = `<div class="message-content"><p>${query}</p></div>`;
+                chatWindow.appendChild(userMessage);
+            }
+
+            function appendBotMessage(content) {
+                const botMessage = document.createElement('div');
+                botMessage.classList.add('chat-message', 'bot-message');
+                botMessage.innerHTML = `<div class="message-content">${content}</div>`;
+                chatWindow.appendChild(botMessage);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+            }
+
+            function createDocumentCard(doc, index) {
+                const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
+                const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
+                const contextId = `context-${Date.now()}-${index}`;
+                return `
+                    <div class="doc-card">
+                        <div class="card-header"><h3>${doc.Content_Title || 'Untitled Document'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
+                        <div class="card-body"><p>${doc.Description || 'No description available.'}</p></div>
+                        <div class="card-footer">
+                            <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
+                            <button class="button-primary summarize-btn" data-url="${doc.Link}" onclick="getSummary(this, '${contextId}')">Summarize</button>
+                        </div>
+                        <div class="context-wrapper" id="${contextId}"></div>
+                    </div>`;
+            }
+
+            function performChat() {
+                const message = queryInput.value.trim();
+                if (!message) return;
+                
+                chatContainer.classList.add('has-messages');
+                document.querySelector('.initial-message')?.remove();
+
+                appendUserMessage(message);
+                queryInput.value = '';
+
+                // Add user message to history before sending the request
+                chatHistory.push({ role: 'user', content: message });
+
+                const loadingIndicator = `<div class="loading-state"><div class="spinner"></div><span>Thinking...</span></div>`;
+                appendBotMessage(loadingIndicator);
+
+                fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    // Send the complete history with the new message
+                    body: JSON.stringify({ message: message, history: chatHistory })
+                })
+                .then(response => response.json())
+                .then(response => {
+                    chatWindow.removeChild(chatWindow.lastChild); 
+
+                    if (response.error) {
+                        appendBotMessage(`<p class="error">Error: ${response.error}</p>`);
+                        chatHistory.pop(); // On error, remove the user message that caused it
+                        return;
+                    }
+
+                    let botResponseHTML = '';
+                    if (response.message) {
+                        botResponseHTML += `<p>${response.message}</p>`;
+                    }
+
+                    if (response.type === 'documents' && response.data?.length > 0) {
+                        const documentCardsHTML = response.data.map(createDocumentCard).join('');
+                        botResponseHTML += documentCardsHTML;
+                    }
+                    
+                    if (botResponseHTML) {
+                        appendBotMessage(botResponseHTML);
+                        // Add the bot's textual response to history
+                        chatHistory.push({ role: 'bot', content: response.message });
+                    } else {
+                        const fallbackMessage = `<p>I'm not sure how to respond to that. Please try again.</p>`;
+                        appendBotMessage(fallbackMessage);
+                        chatHistory.push({ role: 'bot', content: "I'm not sure how to respond." });
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    chatWindow.removeChild(chatWindow.lastChild);
+                    appendBotMessage(`<p class="error">An error occurred while fetching results.</p>`);
+                    chatHistory.pop(); // On error, remove the user message that caused it
+                });
             }
         });
 
-        function appendUserMessage(query) {
-            const userMessage = document.createElement('div');
-            userMessage.classList.add('chat-message', 'user-message');
-            userMessage.innerHTML = `<div class="message-content"><p>${query}</p></div>`;
-            chatWindow.appendChild(userMessage);
-        }
-
-        function appendBotMessage(content) {
-            const botMessage = document.createElement('div');
-            botMessage.classList.add('chat-message', 'bot-message');
-            botMessage.innerHTML = content;
-            chatWindow.appendChild(botMessage);
-            chatWindow.scrollTop = chatWindow.scrollHeight;
-        }
-
-        function performSearch() {
-            const query = queryInput.value.trim();
-            if (!query) return;
-            
-            chatContainer.classList.add('has-messages');
-
-            const initialMessage = document.querySelector('.initial-message');
-            if (initialMessage) {
-                initialMessage.remove();
-            }
-
-            appendUserMessage(query);
-            queryInput.value = '';
-
-            const loadingIndicator = `
-                <div class="message-content">
-                    <div class="loading-state">
-                        <div class="spinner"></div>
-                        <span>Searching...</span>
-                    </div>
-                </div>
-            `;
-            appendBotMessage(loadingIndicator);
-
-            fetch('/search', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query: query })
-            })
-            .then(response => response.json())
-            .then(data => {
-                chatWindow.removeChild(chatWindow.lastChild);
-
-                if (data.error) {
-                    appendBotMessage(`<div class="message-content error"><p>Error: ${data.error}</p></div>`);
-                    return;
-                }
-                if (data.length === 0) {
-                    appendBotMessage(`<div class="message-content"><p>No documents found. Please try a different search term.</p></div>`);
-                } else {
-                    const resultsHTML = data.map((doc, index) => {
-                        const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
-                        const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
-                        
-                        // **FIX:** The link is now stored in a data-url attribute for safety.
-                        return `
-                            <div class="doc-card">
-                                <div class="card-header">
-                                    <h3>${doc.Content_Title || 'Untitled Document'}</h3>
-                                    <div class="tags">${productHTML}${docTypeHTML}</div>
-                                </div>
-                                <div class="card-body"><p>${doc.Description || 'No description available.'}</p></div>
-                                <div class="card-footer">
-                                    <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
-                                    <button class="button-primary summarize-btn" 
-                                            data-url="${doc.Link}" 
-                                            onclick="getSummary(this, 'context-${index}')">Summarize</button>
-                                </div>
-                                <div class="context-wrapper" id="context-${index}"></div>
-                            </div>
-                        `;
-                    }).join('');
-                    appendBotMessage(`<div class="message-content">${resultsHTML}</div>`);
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                chatWindow.removeChild(chatWindow.lastChild);
-                appendBotMessage(`<div class="message-content error"><p>An error occurred while fetching results.</p></div>`);
-            });
-        }
-
-        // **FIX:** The function now gets the URL from the button's data attribute.
+        // This function needs to be global to be called by the onclick attribute
         function getSummary(button, contextId) {
-            const url = button.getAttribute('data-url');
+            const url = button.dataset.url;
             const contextWrapper = document.getElementById(contextId);
-            
             button.disabled = true;
             button.textContent = 'Summarizing...';
-            contextWrapper.innerHTML = '';
-
+            contextWrapper.innerHTML = `<div class="loading-state" style="padding: 1rem 0;"><div class="spinner"></div><span>Fetching and summarizing...</span></div>`;
             fetch('/summarize', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -147,7 +156,8 @@
             })
             .then(response => response.json())
             .then(data => {
-                contextWrapper.innerHTML = `<div class="context-container"><strong>Context:</strong> ${data.summary}</div>`;
+                const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
+                contextWrapper.innerHTML = summaryHTML;
                 button.style.display = 'none';
             })
             .catch(error => {
