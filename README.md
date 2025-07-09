@@ -1,6 +1,8 @@
 WSM Content Assistant
 An intelligent, conversational AI assistant designed to help users find and understand software documentation. This application leverages the Google Gemini API to provide natural language search and on-demand document summarization.
 
+![image](https://github.com/user-attachments/assets/0a37a9d4-77ae-4f0b-a461-f7d69856d901)
+
 
 ✨ Features
  - Conversational Search: Ask for documents in plain English (e.g., "find me case studies for ADManager Plus").
