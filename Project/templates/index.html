@@ -1,159 +1,161 @@
-import os
-import json
-import re
-import requests
-from bs4 import BeautifulSoup
-import fitz
-from flask import Flask, render_template, request, jsonify
-import google.generativeai as genai
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSM Content Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="chat-container">
+        <header class="app-header">
+            <h1>WSM Content Assistant</h1>
+        </header>
 
-load_dotenv()
-app = Flask(__name__)
+        <main id="chat-window" class="chat-window">
+            <div class="initial-message">
+                <p>How can I help you today?</p>
+            </div>
+        </main>
 
-# --- Database & AI Setup ---
-DATABASE_URL = os.environ.get('DATABASE_URL')
-if not DATABASE_URL: raise ValueError("DATABASE_URL is not set in .env file.")
-engine = create_engine(DATABASE_URL)
+        <footer class="search-footer">
+            <div class="search-container">
+                <input type="text" id="queryInput" placeholder="Ask about a product, document type, or keyword...">
+                <button id="searchButton" aria-label="Send">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                </button>
+            </div>
+        </footer>
+    </div>
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY is not set in .env file.")
-genai.configure(api_key=GEMINI_API_KEY)
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const queryInput = document.getElementById('queryInput');
+            const searchButton = document.getElementById('searchButton');
+            const chatWindow = document.getElementById('chat-window');
+            const chatContainer = document.querySelector('.chat-container');
 
-# --- Product Acronym Mapping ---
-PRODUCT_ACRONYM_MAP = {
-    "ADManager Plus": ["ADMP"],
-    "ADAudit Plus": ["ADAP"],
-    "ADSelfService Plus": ["ADSSP"],
-    "Recovery Manager Plus": ["RMP"],
-    "Exchange Reporter Plus": ["ERP"],
-    "M365 Manager Plus": ["MMP", "M365MP"],
-    "SharePoint Manager Plus": ["SPMP"],
-    "DataSecurity Plus": ["DSP"],
-    "Identity360": ["ID360"],
-    "AD360": [],
-    "Log360": []
-}
+            searchButton.addEventListener('click', performChat);
+            
+            queryInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    performChat();
+                }
+            });
 
-def search_database(product: str = None, document_type: str = None, keywords: list = None):
-    """The 'tool' for searching the database."""
-    print(f"--- DATABASE SEARCH ---")
-    print(f"Product: {product}, Doc Type: {document_type}, Keywords: {keywords}")
-    conditions, params = [], {}
-    if product:
-        conditions.append('"Product" ILIKE :product')
-        params['product'] = f"%{product}%"
-    if document_type:
-        conditions.append('"Doc_type" ILIKE :doc_type')
-        params['doc_type'] = f"%{document_type}%"
-    if keywords:
-        keyword_conditions = []
-        for i, keyword in enumerate(keywords):
-            param_name = f"keyword_{i}"
-            keyword_search_clause = (f'("Content_Title" ILIKE :{param_name} OR "Description" ILIKE :{param_name} OR "Generated_Keywords" ILIKE :{param_name})')
-            keyword_conditions.append(keyword_search_clause)
-            params[param_name] = f"%{keyword}%"
-        if keyword_conditions:
-            conditions.append(f"({ ' OR '.join(keyword_conditions) })")
-    if not conditions: return []
-    sql_where_clause = " AND ".join(conditions)
-    try:
-        with engine.connect() as conn:
-            query_string = f'SELECT "Product", "Doc_type", "Content_Title", "Description", "Link" FROM content_repo WHERE {sql_where_clause} LIMIT 10'
-            cursor = conn.execute(text(query_string), params)
-            return [dict(row._mapping) for row in cursor.fetchall()]
-    except Exception as e:
-        print(f"Database query error: {e}")
-        return []
+            function appendUserMessage(query) {
+                const userMessage = document.createElement('div');
+                userMessage.classList.add('chat-message', 'user-message');
+                userMessage.innerHTML = `<div class="message-content"><p>${query}</p></div>`;
+                chatWindow.appendChild(userMessage);
+            }
 
-def fetch_and_summarize_document(url):
-    """Fetches content from a URL and summarizes it."""
-    try:
-        if 'workdrive' in url: return "This is an internal document and cannot be summarized automatically."
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-        page_text = ""
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
-            with fitz.open(stream=response.content, filetype="pdf") as pdf_doc:
-                for page in pdf_doc: page_text += page.get_text() + " "
-        else:
-            soup = BeautifulSoup(response.content, 'html.parser')
-            for element in soup(['script', 'style', 'nav', 'footer', 'header']): element.decompose()
-            page_text = soup.get_text(separator=' ', strip=True)
-        if not page_text.strip(): return "Could not extract meaningful text."
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        summarization_prompt = f"Please provide a concise, 2-3 sentence summary of the following document content:\n\n{page_text[:8000]}"
-        summary_response = model.generate_content(summarization_prompt)
-        return summary_response.text.strip()
-    except Exception as e: return f"An error occurred during processing: {e}"
+            function appendBotMessage(content) {
+                const botMessage = document.createElement('div');
+                botMessage.classList.add('chat-message', 'bot-message');
+                botMessage.innerHTML = `<div class="message-content">${content}</div>`;
+                chatWindow.appendChild(botMessage);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+            }
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+            function createDocumentCard(doc, index) {
+                const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
+                const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
+                const contextId = `context-${Date.now()}-${index}`;
+                return `
+                    <div class="doc-card">
+                        <div class="card-header"><h3>${doc.Content_Title || 'Untitled Document'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
+                        <div class="card-body"><p>${doc.Description || 'No description available.'}</p></div>
+                        <div class="card-footer">
+                            <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
+                            <button class="button-primary summarize-btn" data-url="${doc.Link}" onclick="getSummary(this, '${contextId}')">Summarize</button>
+                        </div>
+                        <div class="context-wrapper" id="${contextId}"></div>
+                    </div>`;
+            }
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    user_message = request.json.get('message', '')
-    context = request.json.get('context', {})
-    if not user_message: return jsonify({"error": "No message provided."}), 400
-
-    product_map_string = json.dumps(PRODUCT_ACRONYM_MAP, indent=2)
-    agent_prompt = f"""
-You are an AI assistant that extracts information from a user's message. Your only job is to identify any product names, document types, or keywords from the user's text.
-
-**CRITICAL INSTRUCTION 1: Product Name Normalization**
-You MUST normalize any product names or acronyms to their canonical name from this map.
-{product_map_string}
-
-**CRITICAL INSTRUCTION 2: Document Type Mapping**
-You MUST map user requests to one of these known `document_type` values if possible: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
-
-Respond ONLY with a valid JSON object with the parameters you identified.
-JSON Structure: {{"product": "string | null", "document_type": "string | null", "keywords": ["string"]}}
-
-User's message: "{user_message}"
-"""
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(agent_prompt)
-        ai_response_text = response.text.strip()
-        
-        json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
-        if json_match:
-            json_string = json_match.group(0)
-            try:
-                parsed_params = json.loads(json_string)
+            function performChat() {
+                const message = queryInput.value.trim();
+                if (!message) return;
                 
-                final_params = context.copy()
-                for key, value in parsed_params.items():
-                    if value:
-                        final_params[key] = value
+                chatContainer.classList.add('has-messages');
+                document.querySelector('.initial-message')?.remove();
 
-                documents = search_database(
-                    product=final_params.get("product"),
-                    document_type=final_params.get("document_type"),
-                    keywords=final_params.get("keywords")
-                )
-                response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
-                return jsonify({"type": "documents", "message": response_message, "data": documents, "context": final_params})
-            except json.JSONDecodeError: pass
-        
-        return jsonify({"type": "conversation", "message": "I'm sorry, I didn't understand that. Could you please rephrase your request?", "context": {}})
+                appendUserMessage(message);
+                queryInput.value = '';
 
-    except Exception as e:
-        print(f"An error occurred in the chat endpoint: {e}")
-        return jsonify({"error": "An error occurred while processing your request."}), 500
+                const loadingIndicator = `<div class="loading-state"><div class="spinner"></div><span>Thinking...</span></div>`;
+                appendBotMessage(loadingIndicator);
 
-@app.route('/summarize', methods=['POST'])
-def summarize():
-    url = request.json.get('url')
-    if not url: return jsonify({'summary': 'No URL provided.'}), 400
-    summary = fetch_and_summarize_document(url)
-    return jsonify({'summary': summary})
+                fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message }) // No history is sent
+                })
+                .then(response => response.json())
+                .then(response => {
+                    chatWindow.removeChild(chatWindow.lastChild); 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+                    if (response.error) {
+                        appendBotMessage(`<p class="error">Error: ${response.error}</p>`);
+                        return;
+                    }
+
+                    let botResponseHTML = '';
+                    if (response.message) {
+                        botResponseHTML += `<p>${response.message}</p>`;
+                    }
+
+                    if (response.type === 'documents' && response.data?.length > 0) {
+                        const documentCardsHTML = response.data.map(createDocumentCard).join('');
+                        botResponseHTML += documentCardsHTML;
+                    }
+                    
+                    if (botResponseHTML) {
+                        appendBotMessage(botResponseHTML);
+                    } else {
+                        const fallbackMessage = `<p>I'm not sure how to respond to that. Please try again.</p>`;
+                        appendBotMessage(fallbackMessage);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    chatWindow.removeChild(chatWindow.lastChild);
+                    appendBotMessage(`<p class="error">An error occurred while fetching results.</p>`);
+                });
+            }
+        });
+
+        // This function needs to be global to be called by the onclick attribute
+        function getSummary(button, contextId) {
+            const url = button.dataset.url;
+            const contextWrapper = document.getElementById(contextId);
+            button.disabled = true;
+            button.textContent = 'Summarizing...';
+            contextWrapper.innerHTML = `<div class="loading-state" style="padding: 1rem 0;"><div class="spinner"></div><span>Fetching and summarizing...</span></div>`;
+            fetch('/summarize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url })
+            })
+            .then(response => response.json())
+            .then(data => {
+                const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
+                contextWrapper.innerHTML = summaryHTML;
+                button.style.display = 'none';
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                contextWrapper.innerHTML = `<div class="context-container error">Failed to get summary.</div>`;
+                button.disabled = false;
+                button.textContent = 'Summarize';
+            });
+        }
+    </script>
+</body>
+</html>
 
