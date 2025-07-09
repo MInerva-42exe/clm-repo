@@ -14,11 +14,13 @@ app = Flask(__name__)
 
 # --- Database & AI Setup ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
-if not DATABASE_URL: raise ValueError("DATABASE_URL is not set in .env file.")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set in .env file.")
 engine = create_engine(DATABASE_URL)
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY is not set in .env file.")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set in .env file.")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # --- Product Acronym Mapping ---
@@ -35,6 +37,35 @@ PRODUCT_ACRONYM_MAP = {
     "AD360": [],
     "Log360": []
 }
+
+# --- AI Tool Definition ---
+# Define the database search function as a tool for the AI
+search_tool = genai.protos.Tool(
+    function_declarations=[
+        genai.protos.FunctionDeclaration(
+            name='search_database',
+            description="Searches the content database for documents based on product, document type, and keywords.",
+            parameters=genai.protos.Schema(
+                type=genai.protos.Type.OBJECT,
+                properties={
+                    'product': genai.protos.Schema(type=genai.protos.Type.STRING, description="The full product name, e.g., 'ADManager Plus'"),
+                    'document_type': genai.protos.Schema(type=genai.protos.Type.STRING, description="The type of document, e.g., 'Case study' or 'Technical Document'"),
+                    'keywords': genai.protos.Schema(
+                        type=genai.protos.Type.ARRAY,
+                        items=genai.protos.Schema(type=genai.protos.Type.STRING),
+                        description="A list of keywords from the user's query."
+                    )
+                }
+            )
+        )
+    ]
+)
+
+# Initialize the model with the tool
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash',
+    tools=[search_tool]
+)
 
 def search_database(product: str = None, document_type: str = None, keywords: list = None):
     """The 'tool' for searching the database."""
@@ -56,7 +87,8 @@ def search_database(product: str = None, document_type: str = None, keywords: li
             params[param_name] = f"%{keyword}%"
         if keyword_conditions:
             conditions.append(f"({ ' OR '.join(keyword_conditions) })")
-    if not conditions: return []
+    if not conditions:
+        return []
     sql_where_clause = " AND ".join(conditions)
     try:
         with engine.connect() as conn:
@@ -70,7 +102,8 @@ def search_database(product: str = None, document_type: str = None, keywords: li
 def fetch_and_summarize_document(url):
     """Fetches content from a URL and summarizes it."""
     try:
-        if 'workdrive' in url: return "This is an internal document and cannot be summarized automatically."
+        if 'workdrive' in url:
+            return "This is an internal document and cannot be summarized automatically."
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
         response.raise_for_status()
@@ -78,17 +111,21 @@ def fetch_and_summarize_document(url):
         content_type = response.headers.get('Content-Type', '').lower()
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             with fitz.open(stream=response.content, filetype="pdf") as pdf_doc:
-                for page in pdf_doc: page_text += page.get_text() + " "
+                for page in pdf_doc:
+                    page_text += page.get_text() + " "
         else:
             soup = BeautifulSoup(response.content, 'html.parser')
-            for element in soup(['script', 'style', 'nav', 'footer', 'header']): element.decompose()
+            for element in soup(['script', 'style', 'nav', 'footer', 'header']):
+                element.decompose()
             page_text = soup.get_text(separator=' ', strip=True)
-        if not page_text.strip(): return "Could not extract meaningful text."
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        if not page_text.strip():
+            return "Could not extract meaningful text."
+        summarization_model = genai.GenerativeModel('gemini-1.5-flash')
         summarization_prompt = f"Please provide a concise, 2-3 sentence summary of the following document content:\n\n{page_text[:8000]}"
-        summary_response = model.generate_content(summarization_prompt)
+        summary_response = summarization_model.generate_content(summarization_prompt)
         return summary_response.text.strip()
-    except Exception as e: return f"An error occurred during processing: {e}"
+    except Exception as e:
+        return f"An error occurred during processing: {e}"
 
 @app.route('/')
 def index():
@@ -97,54 +134,44 @@ def index():
 @app.route('/chat', methods=['POST'])
 def chat():
     user_message = request.json.get('message', '')
-    if not user_message: return jsonify({"error": "No message provided."}), 400
+    if not user_message:
+        return jsonify({"error": "No message provided."}), 400
 
     product_map_string = json.dumps(PRODUCT_ACRONYM_MAP, indent=2)
     agent_prompt = f"""
-You are WSM Content Assistant, a friendly and helpful AI expert on software documentation.
-Your ONLY function is to help users find documents from a database by identifying search parameters in their message.
+You are WSM Content Assistant, a friendly and helpful AI expert on software documentation. Your goal is to help users find documents.
 
-**CRITICAL INSTRUCTION 1: Product Name Normalization**
-You MUST normalize any product names or acronyms to their canonical name from this map.
-**Product Acronym Map:**
-{product_map_string}
-
-**CRITICAL INSTRUCTION 2: Document Type Mapping**
-You MUST intelligently map user requests to one of these known `document_type` values: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
-
-**YOUR RESPONSE LOGIC:**
-1.  **Tool Call:** If the user asks to find a document, you MUST respond ONLY with a valid JSON object to call the `search_database` tool.
-2.  **Refusal:** If the user asks a question you cannot answer (like "what is the most popular document?"), you MUST refuse politely.
-3.  **Clarification/Conversation:** For any other message, respond conversationally and guide the user to a search.
+**Instructions:**
+1.  Analyze the user's message to identify a product, document type, and keywords.
+2.  **Normalize Product Names:** You MUST normalize product names and acronyms using this map before calling the tool. For example, 'ADMP' should become 'ADManager Plus'.
+    {product_map_string}
+3.  **Call the Tool:** If you have enough information to search, call the `search_database` tool.
+4.  **Converse:** If the user's message is not a search request (e.g., "hello", "thank you"), respond conversationally. If the request is ambiguous, ask clarifying questions.
 
 User's message: "{user_message}"
 """
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(agent_prompt)
-        ai_response_text = response.text.strip()
-        
-        tool_call = None
-        json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
-        if json_match:
-            try:
-                parsed_json = json.loads(json_match.group(0))
-                if parsed_json.get("tool") == "search_database" and "parameters" in parsed_json:
-                    tool_call = parsed_json
-            except json.JSONDecodeError:
-                tool_call = None
+        response_part = response.candidates[0].content.parts[0]
 
-        if tool_call:
-            params = tool_call.get("parameters", {})
+        # Check if the model requested a tool call
+        if response_part.function_call and response_part.function_call.name == "search_database":
+            params = {key: value for key, value in response_part.function_call.args.items()}
+            print(f"--- TOOL CALL DETECTED ---")
+            print(f"Function: search_database, Parameters: {params}")
+
             documents = search_database(
                 product=params.get("product"),
                 document_type=params.get("document_type"),
                 keywords=params.get("keywords")
             )
+
             response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
             return jsonify({"type": "documents", "message": response_message, "data": documents})
-        
-        return jsonify({"type": "conversation", "message": ai_response_text})
+
+        # If no tool call, it's a conversational response
+        else:
+            return jsonify({"type": "conversation", "message": response.text})
 
     except Exception as e:
         print(f"An error occurred in the chat endpoint: {e}")
@@ -153,9 +180,10 @@ User's message: "{user_message}"
 @app.route('/summarize', methods=['POST'])
 def summarize():
     url = request.json.get('url')
-    if not url: return jsonify({'summary': 'No URL provided.'}), 400
+    if not url:
+        return jsonify({'summary': 'No URL provided.'}), 400
     summary = fetch_and_summarize_document(url)
     return jsonify({'summary': summary})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
