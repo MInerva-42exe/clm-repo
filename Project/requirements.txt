@@ -1,7 +1,9 @@
 Flask
-gunicorn
-python-dotenv
-google-generativeai
 requests
 beautifulsoup4
 PyMuPDF
+google-generativeai
+gunicorn
+psycopg2-binary
+SQLAlchemy
+python-dotenv
