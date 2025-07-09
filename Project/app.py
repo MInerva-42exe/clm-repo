@@ -97,22 +97,25 @@ def index():
 @app.route('/chat', methods=['POST'])
 def chat():
     user_message = request.json.get('message', '')
-    context = request.json.get('context', {})
     if not user_message: return jsonify({"error": "No message provided."}), 400
 
     product_map_string = json.dumps(PRODUCT_ACRONYM_MAP, indent=2)
     agent_prompt = f"""
-You are an AI assistant that extracts information from a user's message. Your only job is to identify any product names, document types, or keywords from the user's text.
+You are WSM Content Assistant, a friendly and helpful AI expert on software documentation.
+Your ONLY function is to help users find documents from a database by identifying search parameters in their message.
 
 **CRITICAL INSTRUCTION 1: Product Name Normalization**
 You MUST normalize any product names or acronyms to their canonical name from this map.
+**Product Acronym Map:**
 {product_map_string}
 
 **CRITICAL INSTRUCTION 2: Document Type Mapping**
-You MUST map user requests to one of these known `document_type` values if possible: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
+You MUST intelligently map user requests to one of these known `document_type` values: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
 
-Respond ONLY with a valid JSON object with the parameters you identified.
-JSON Structure: {{"product": "string | null", "document_type": "string | null", "keywords": ["string"]}}
+**YOUR RESPONSE LOGIC:**
+1.  **Tool Call:** If the user asks to find a document, you MUST respond ONLY with a valid JSON object to call the `search_database` tool.
+2.  **Refusal:** If the user asks a question you cannot answer (like "what is the most popular document?"), you MUST refuse politely.
+3.  **Clarification/Conversation:** For any other message, respond conversationally and guide the user to a search.
 
 User's message: "{user_message}"
 """
@@ -121,27 +124,27 @@ User's message: "{user_message}"
         response = model.generate_content(agent_prompt)
         ai_response_text = response.text.strip()
         
+        tool_call = None
         json_match = re.search(r'\{.*\}', ai_response_text, re.DOTALL)
         if json_match:
-            json_string = json_match.group(0)
             try:
-                parsed_params = json.loads(json_string)
-                
-                final_params = context.copy()
-                for key, value in parsed_params.items():
-                    if value:
-                        final_params[key] = value
+                parsed_json = json.loads(json_match.group(0))
+                if parsed_json.get("tool") == "search_database" and "parameters" in parsed_json:
+                    tool_call = parsed_json
+            except json.JSONDecodeError:
+                tool_call = None
 
-                documents = search_database(
-                    product=final_params.get("product"),
-                    document_type=final_params.get("document_type"),
-                    keywords=final_params.get("keywords")
-                )
-                response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
-                return jsonify({"type": "documents", "message": response_message, "data": documents, "context": final_params})
-            except json.JSONDecodeError: pass
+        if tool_call:
+            params = tool_call.get("parameters", {})
+            documents = search_database(
+                product=params.get("product"),
+                document_type=params.get("document_type"),
+                keywords=params.get("keywords")
+            )
+            response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
+            return jsonify({"type": "documents", "message": response_message, "data": documents})
         
-        return jsonify({"type": "conversation", "message": "I'm sorry, I didn't understand that. Could you please rephrase your request?", "context": {}})
+        return jsonify({"type": "conversation", "message": ai_response_text})
 
     except Exception as e:
         print(f"An error occurred in the chat endpoint: {e}")
