@@ -94,9 +94,15 @@
                 fetch('/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: message }) // No history is sent
+                    body: JSON.stringify({ message: message })
                 })
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        // If response is not ok (e.g., 500 error), throw an error to be caught by the .catch block
+                        return response.json().then(err => { throw new Error(err.error || 'Server error'); });
+                    }
+                    return response.json();
+                })
                 .then(response => {
                     chatWindow.removeChild(chatWindow.lastChild); 
 
@@ -107,7 +113,7 @@
 
                     let botResponseHTML = '';
                     if (response.message) {
-                        botResponseHTML += `<p>${response.message}</p>`;
+                        botResponseHTML += `<p>${response.message.replace(/\n/g, '<br>')}</p>`;
                     }
 
                     if (response.type === 'documents' && response.data?.length > 0) {
@@ -128,33 +134,32 @@
                     appendBotMessage(`<p class="error">An error occurred while fetching results.</p>`);
                 });
             }
+             // Make getSummary globally accessible
+            window.getSummary = function(button, contextId) {
+                const url = button.dataset.url;
+                const contextWrapper = document.getElementById(contextId);
+                button.disabled = true;
+                button.textContent = 'Summarizing...';
+                contextWrapper.innerHTML = `<div class="loading-state" style="padding: 1rem 0;"><div class="spinner"></div><span>Fetching and summarizing...</span></div>`;
+                fetch('/summarize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
+                    contextWrapper.innerHTML = summaryHTML;
+                    button.style.display = 'none';
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    contextWrapper.innerHTML = `<div class="context-container error">Failed to get summary.</div>`;
+                    button.disabled = false;
+                    button.textContent = 'Summarize';
+                });
+            }
         });
-
-        // This function needs to be global to be called by the onclick attribute
-        function getSummary(button, contextId) {
-            const url = button.dataset.url;
-            const contextWrapper = document.getElementById(contextId);
-            button.disabled = true;
-            button.textContent = 'Summarizing...';
-            contextWrapper.innerHTML = `<div class="loading-state" style="padding: 1rem 0;"><div class="spinner"></div><span>Fetching and summarizing...</span></div>`;
-            fetch('/summarize', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: url })
-            })
-            .then(response => response.json())
-            .then(data => {
-                const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
-                contextWrapper.innerHTML = summaryHTML;
-                button.style.display = 'none';
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                contextWrapper.innerHTML = `<div class="context-container error">Failed to get summary.</div>`;
-                button.disabled = false;
-                button.textContent = 'Summarize';
-            });
-        }
     </script>
 </body>
 </html>
