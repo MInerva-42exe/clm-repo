@@ -21,14 +21,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if not GEMINI_API_KEY: raise ValueError("GEMINI_API_KEY is not set in .env file.")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- NEW: Product Acronym Mapping ---
+# --- Product Acronym Mapping ---
 PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"],
     "ADAudit Plus": ["ADAP"],
     "ADSelfService Plus": ["ADSSP"],
-    "Recovery Manager Plus": ["RMP", "RecoveryManager Plus"],
+    "Recovery Manager Plus": ["RMP"],
     "Exchange Reporter Plus": ["ERP"],
-    "M365 Manager Plus": ["MMP", "M365MP", "M365Manager Plus"],
+    "M365 Manager Plus": ["MMP", "M365MP"],
     "SharePoint Manager Plus": ["SPMP"],
     "DataSecurity Plus": ["DSP"],
     "Identity360": ["ID360"],
@@ -97,40 +97,24 @@ def index():
 @app.route('/chat', methods=['POST'])
 def chat():
     user_message = request.json.get('message', '')
-    history = request.json.get('history', [])
+    context = request.json.get('context', {})
     if not user_message: return jsonify({"error": "No message provided."}), 400
 
-    history_string = ""
-    for turn in history:
-        role = "User" if turn['role'] == 'user' else "Assistant"
-        content = turn['content'].split('\n')[0] 
-        history_string += f"{role}: {content}\n"
-
-    # --- UPDATED PROMPT ---
-    # Convert the product map to a string to include in the prompt
     product_map_string = json.dumps(PRODUCT_ACRONYM_MAP, indent=2)
-
     agent_prompt = f"""
-You are WSM Content Assistant, a friendly, conversational, and highly intelligent AI expert on software documentation.
-Your primary goal is to help users find documents by calling your `search_database` tool.
-You MUST use the conversation history to understand the context of the user's latest message.
+You are an AI assistant that extracts information from a user's message. Your only job is to identify any product names, document types, or keywords from the user's text.
 
 **CRITICAL INSTRUCTION 1: Product Name Normalization**
-When a user mentions a product, you MUST normalize it to its canonical name using the provided map. Be flexible with spacing and acronyms.
-**Product Acronym Map:**
+You MUST normalize any product names or acronyms to their canonical name from this map.
 {product_map_string}
 
 **CRITICAL INSTRUCTION 2: Document Type Mapping**
-You MUST intelligently map user requests to one of these known `document_type` values: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
+You MUST map user requests to one of these known `document_type` values if possible: "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other".
 
-**YOUR RESPONSE LOGIC:**
-1.  **Tool Call:** Based on the user's message and the conversation history, if you have enough information to search, respond ONLY with a valid JSON object to call the `search_database` tool.
-2.  **Clarification:** If the request is too vague, ask clarifying questions.
-3.  **Conversation:** If the user is just chatting, respond naturally.
+Respond ONLY with a valid JSON object with the parameters you identified.
+JSON Structure: {{"product": "string | null", "document_type": "string | null", "keywords": ["string"]}}
 
-**Conversation History:**
-{history_string}
-**User's latest message:** "{user_message}"
+User's message: "{user_message}"
 """
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -141,18 +125,23 @@ You MUST intelligently map user requests to one of these known `document_type` v
         if json_match:
             json_string = json_match.group(0)
             try:
-                tool_call = json.loads(json_string)
-                if "document_type" in tool_call or "product" in tool_call or "keywords" in tool_call:
-                    documents = search_database(
-                        product=tool_call.get("product"),
-                        document_type=tool_call.get("document_type"),
-                        keywords=tool_call.get("keywords")
-                    )
-                    response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
-                    return jsonify({"type": "documents", "message": response_message, "data": documents})
+                parsed_params = json.loads(json_string)
+                
+                final_params = context.copy()
+                for key, value in parsed_params.items():
+                    if value:
+                        final_params[key] = value
+
+                documents = search_database(
+                    product=final_params.get("product"),
+                    document_type=final_params.get("document_type"),
+                    keywords=final_params.get("keywords")
+                )
+                response_message = f"I found {len(documents)} document(s) for you:" if documents else "I couldn't find any documents that match your request. Please try different terms."
+                return jsonify({"type": "documents", "message": response_message, "data": documents, "context": final_params})
             except json.JSONDecodeError: pass
         
-        return jsonify({"type": "conversation", "message": ai_response_text})
+        return jsonify({"type": "conversation", "message": "I'm sorry, I didn't understand that. Could you please rephrase your request?", "context": {}})
 
     except Exception as e:
         print(f"An error occurred in the chat endpoint: {e}")
