@@ -4,28 +4,23 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WSM Content Assistant</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Your CSS link or <style> block goes here -->
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="chat-container">
-        <header class="app-header">
-            <h1>WSM Content Assistant</h1>
-        </header>
-
+        <!-- Your HTML structure (header, main, footer) remains the same -->
+        <header class="app-header"><h1>WSM Content Assistant</h1></header>
         <main id="chat-window" class="chat-window">
-            <div class="initial-message">
-                <p>How can I help you today?</p>
+             <div class="chat-message bot-message">
+                <div class="message-content"><p>How can I help you today?</p></div>
             </div>
         </main>
-
         <footer class="search-footer">
             <div class="search-container">
                 <input type="text" id="queryInput" placeholder="Ask about a product, document type, or keyword...">
                 <button id="searchButton" aria-label="Send">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
                 </button>
             </div>
         </footer>
@@ -36,10 +31,9 @@
             const queryInput = document.getElementById('queryInput');
             const searchButton = document.getElementById('searchButton');
             const chatWindow = document.getElementById('chat-window');
-            const chatContainer = document.querySelector('.chat-container');
+            let chatHistory = [];
 
             searchButton.addEventListener('click', performChat);
-            
             queryInput.addEventListener('keydown', (event) => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
@@ -47,114 +41,114 @@
                 }
             });
 
-            function appendUserMessage(query) {
-                const userMessage = document.createElement('div');
-                userMessage.classList.add('chat-message', 'user-message');
-                userMessage.innerHTML = `<div class="message-content"><p>${query}</p></div>`;
-                chatWindow.appendChild(userMessage);
-            }
-
-            function appendBotMessage(content) {
-                const botMessage = document.createElement('div');
-                botMessage.classList.add('chat-message', 'bot-message');
-                botMessage.innerHTML = `<div class="message-content">${content}</div>`;
-                chatWindow.appendChild(botMessage);
+            function appendMessage(content, sender) {
+                const messageDiv = document.createElement('div');
+                messageDiv.classList.add('chat-message', `${sender}-message`);
+                if (typeof content === 'string') {
+                     messageDiv.innerHTML = `<div class="message-content">${content.replace(/\n/g, '<br>')}</div>`;
+                } else {
+                    messageDiv.innerHTML = `<div class="message-content">${content.message}<div class="doc-cards-container">${content.data.map(createDocumentCard).join('')}</div></div>`;
+                }
+                chatWindow.appendChild(messageDiv);
                 chatWindow.scrollTop = chatWindow.scrollHeight;
             }
-
-            function createDocumentCard(doc, index) {
+            
+            function createDocumentCard(doc) {
                 const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
                 const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
-                const contextId = `context-${Date.now()}-${index}`;
-                return `
-                    <div class="doc-card">
-                        <div class="card-header"><h3>${doc.Content_Title || 'Untitled Document'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
-                        <div class="card-body"><p>${doc.Description || 'No description available.'}</p></div>
-                        <div class="card-footer">
-                            <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
-                            <button class="button-primary summarize-btn" data-url="${doc.Link}" onclick="getSummary(this, '${contextId}')">Summarize</button>
-                        </div>
-                        <div class="context-wrapper" id="${contextId}"></div>
-                    </div>`;
+                const contextId = `context-${Date.now()}-${Math.random()}`;
+                return `<div class="doc-card">
+                            <div class="card-header"><h3>${doc.Content_Title || 'Untitled'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
+                            <div class="card-body"><p>${doc.Description || 'No description.'}</p></div>
+                            <div class="card-footer">
+                                <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
+                                <button class="button-primary summarize-btn" data-url="${doc.Link}" onclick="getSummary(this, '${contextId}')">Summarize</button>
+                            </div>
+                            <div class="context-wrapper" id="${contextId}"></div>
+                        </div>`;
             }
 
             function performChat() {
                 const message = queryInput.value.trim();
                 if (!message) return;
-                
-                chatContainer.classList.add('has-messages');
-                document.querySelector('.initial-message')?.remove();
-
-                appendUserMessage(message);
+                appendMessage(`<p>${message}</p>`, 'user');
+                chatHistory.push({ role: 'user', parts: [{ text: message }] });
                 queryInput.value = '';
 
-                const loadingIndicator = `<div class="loading-state"><div class="spinner"></div><span>Thinking...</span></div>`;
-                appendBotMessage(loadingIndicator);
+                const loadingIndicator = document.createElement('div');
+                loadingIndicator.classList.add('chat-message', 'bot-message');
+                loadingIndicator.innerHTML = `<div class="message-content"><div class="spinner"></div></div>`;
+                chatWindow.appendChild(loadingIndicator);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
 
                 fetch('/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: message })
+                    body: JSON.stringify({ message: message, history: chatHistory })
                 })
+                .then(response => response.json())
                 .then(response => {
-                    if (!response.ok) {
-                        // If response is not ok (e.g., 500 error), throw an error to be caught by the .catch block
-                        return response.json().then(err => { throw new Error(err.error || 'Server error'); });
-                    }
-                    return response.json();
-                })
-                .then(response => {
-                    chatWindow.removeChild(chatWindow.lastChild); 
-
+                    chatWindow.removeChild(loadingIndicator);
                     if (response.error) {
-                        appendBotMessage(`<p class="error">Error: ${response.error}</p>`);
+                        appendMessage(`<p class="error">${response.error}</p>`, 'bot');
                         return;
                     }
-
-                    let botResponseHTML = '';
-                    if (response.message) {
-                        botResponseHTML += `<p>${response.message.replace(/\n/g, '<br>')}</p>`;
-                    }
-
-                    if (response.type === 'documents' && response.data?.length > 0) {
-                        const documentCardsHTML = response.data.map(createDocumentCard).join('');
-                        botResponseHTML += documentCardsHTML;
-                    }
-                    
-                    if (botResponseHTML) {
-                        appendBotMessage(botResponseHTML);
+                    let botResponseContent;
+                    if (response.type === 'documents') {
+                        botResponseContent = { message: `<p>${response.message}</p>`, data: response.data };
+                        chatHistory.push({ role: 'model', parts: [{ text: response.message }] });
                     } else {
-                        const fallbackMessage = `<p>I'm not sure how to respond to that. Please try again.</p>`;
-                        appendBotMessage(fallbackMessage);
+                        botResponseContent = `<p>${response.message}</p>`;
+                        chatHistory.push({ role: 'model', parts: [{ text: response.message }] });
                     }
+                    appendMessage(botResponseContent, 'bot');
                 })
                 .catch(error => {
+                    chatWindow.removeChild(loadingIndicator);
                     console.error('Error:', error);
-                    chatWindow.removeChild(chatWindow.lastChild);
-                    appendBotMessage(`<p class="error">An error occurred while fetching results.</p>`);
+                    appendMessage(`<p class="error">An error occurred.</p>`, 'bot');
                 });
             }
-             // Make getSummary globally accessible
+
+            // Make getSummary globally accessible
             window.getSummary = function(button, contextId) {
                 const url = button.dataset.url;
                 const contextWrapper = document.getElementById(contextId);
                 button.disabled = true;
                 button.textContent = 'Summarizing...';
                 contextWrapper.innerHTML = `<div class="loading-state" style="padding: 1rem 0;"><div class="spinner"></div><span>Fetching and summarizing...</span></div>`;
+
                 fetch('/summarize', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: url })
                 })
-                .then(response => response.json())
+                .then(response => {
+                    // Check if the response was successful (status 200-299)
+                    if (!response.ok) {
+                        // This will catch hard server errors (500, etc.)
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
                 .then(data => {
-                    const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
-                    contextWrapper.innerHTML = summaryHTML;
-                    button.style.display = 'none';
+                    // --- NEW: Check the 'status' field in the JSON payload ---
+                    if (data.status === 'success') {
+                        const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${data.summary.replace(/\n/g, '<br>')}</div>`;
+                        contextWrapper.innerHTML = summaryHTML;
+                        button.style.display = 'none';
+                    } else {
+                        // Display the friendly error message from the server
+                        const errorHTML = `<div class="context-container error">${data.message}</div>`;
+                        contextWrapper.innerHTML = errorHTML;
+                        button.disabled = false;
+                        button.textContent = 'Summarize';
+                    }
                 })
                 .catch(error => {
                     console.error('Error:', error);
-                    contextWrapper.innerHTML = `<div class="context-container error">Failed to get summary.</div>`;
+                    const errorHTML = `<div class="context-container error">A network error occurred. Please try again.</div>`;
+                    contextWrapper.innerHTML = errorHTML;
                     button.disabled = false;
                     button.textContent = 'Summarize';
                 });
