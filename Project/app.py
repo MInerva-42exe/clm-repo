@@ -1,45 +1,74 @@
 import os
 import json
 from itertools import cycle
+import logging
 
 from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
 from dotenv import load_dotenv
 import google.generativeai as genai
 import google.api_core.exceptions
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+import requests
+from bs4 import BeautifulSoup
+import fitz # PyMuPDF
 
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
+# UPDATED: Using your live Render URL for CORS
+CORS(app, resources={
+    r"/chat": {"origins": "https://clm-repo.onrender.com"},
+    r"/summarize": {"origins": "https://clm-repo.onrender.com"},
+    r"/health": {"origins": "https://clm-repo.onrender.com"}
+})
+logging.basicConfig(level=logging.INFO)
+
 
 # --- Database & AI Key Setup ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in .env file.")
+# echo=False is best for production to avoid noisy logs
+engine = create_engine(DATABASE_URL, echo=False)
 
-# Use the safer method for loading keys
+try:
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    app.logger.info("✅ Database connected successfully!")
+except OperationalError as e:
+    app.logger.error(f"❌ Database connection failed on startup: {e}", exc_info=True)
+    raise
+
+
 GEMINI_API_KEYS_STR = os.environ.get("GEMINI_API_KEYS")
 if not GEMINI_API_KEYS_STR:
     raise ValueError("GEMINI_API_KEYS is not set in .env file.")
 GEMINI_API_KEYS = [k.strip() for k in GEMINI_API_KEYS_STR.split(',') if k.strip()]
 if not GEMINI_API_KEYS:
-    raise ValueError("No valid Gemini API keys found in GEMINI_API_KEYS.")
+    raise ValueError("No valid Gemini API keys found.")
 api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
 
 def generate_content_with_failover(*args, **kwargs):
-    attempts = len(GEMINI_API_KEYS)
-    for _ in range(attempts):
+    for _ in range(len(GEMINI_API_KEYS)):
         try:
+            model_kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in ("tools", "system_instruction", "generation_config")
+            }
+            app.logger.debug(f"Calling Gemini with model_kwargs: {list(model_kwargs.keys())}")
+            
             model = genai.GenerativeModel(
-                model_name='gemini-1.5-flash',
-                tools=kwargs.pop('tools', None),
-                system_instruction=kwargs.pop('system_instruction', None)
+                model_name="gemini-1.5-flash",
+                **model_kwargs
             )
-            return model.generate_content(*args, **kwargs)
+            return model.generate_content(*args)
         except (google.api_core.exceptions.PermissionDenied,
                 google.api_core.exceptions.ResourceExhausted) as e:
-            print(f"Key failed: {e}. Rotating key.")
+            app.logger.warning(f"Key failed: {e}. Rotating key.")
             genai.configure(api_key=next(api_key_cycler))
     raise RuntimeError("All Gemini API keys failed.")
 
@@ -79,7 +108,6 @@ search_tool = genai.protos.Tool(
     ]
 )
 
-# Using the superior, structured prompt
 SYSTEM_PROMPT = f"""
 You are WSM Content Assistant, a friendly, conversational AI expert on software documentation.
 Your sole job when users ask for documents is to call the `search_database` tool; otherwise, respond naturally or ask for clarification.
@@ -129,21 +157,115 @@ Your sole job when users ask for documents is to call the `search_database` tool
 
 
 def search_database(product: str = None, document_type: str = None, keywords: list = None):
-    print(f"DATABASE SEARCH: Product={product}, Type={document_type}, Keywords={keywords}")
-    # Placeholder for your actual database query logic
-    return [{
-        "Product": product or "ADManager Plus",
-        "Doc_type": document_type or "Case study",
-        "Content_Title": "Example Document Title",
-        "Description": "This is an example document description from the database.",
-        "Link": "#"
-    }]
+    """Searches the database for documents with the given parameters."""
+    app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    
+    conditions, params = [], {}
+    if product:
+        conditions.append('"Product" ILIKE :product')
+        params['product'] = f"%{product}%"
+    if document_type:
+        conditions.append('"Doc_type" ILIKE :doc_type')
+        params['doc_type'] = f"%{document_type}%"
+    if keywords:
+        keyword_conditions = []
+        for i, keyword in enumerate(keywords):
+            param_name = f"keyword_{i}"
+            keyword_search_clause = (f'("Content_Title" ILIKE :{param_name} OR "Description" ILIKE :{param_name} OR "Generated_Keywords" ILIKE :{param_name})')
+            keyword_conditions.append(keyword_search_clause)
+            params[param_name] = f"%{keyword}%"
+        if keyword_conditions:
+            conditions.append(f"({ ' OR '.join(keyword_conditions) })")
+
+    if not conditions:
+        return []
+
+    sql_where_clause = " AND ".join(conditions)
+    
+    try:
+        with engine.connect() as conn:
+            query_string = f'SELECT "Product", "Doc_type", "Content_Title", "Description", "Link" FROM content_repo WHERE {sql_where_clause} LIMIT 10'
+            cursor = conn.execute(text(query_string), params)
+            results = [dict(row._mapping) for row in cursor.fetchall()]
+            app.logger.info(f"Found {len(results)} results in the database.")
+            return results
+    except Exception as e:
+        app.logger.error(f"Database query error: {e}", exc_info=True)
+        raise
+
+def fetch_and_summarize_document(url):
+    """Fetches content from a URL and summarizes it based on specific rules."""
+    app.logger.info(f"Attempting to summarize URL: {url}")
+
+    if 'workdrive' in url:
+        app.logger.info("URL is an internal workdrive link. Skipping.")
+        return "This is an internal document and cannot be summarized."
+
+    is_allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url
+    is_pdf = url.lower().endswith('.pdf')
+
+    if is_allowed_domain or is_pdf:
+        app.logger.info("URL is allowed. Proceeding with summarization.")
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
+            response.raise_for_status()
+            
+            page_text = ""
+            content_type = response.headers.get('Content-Type', '').lower()
+
+            if 'application/pdf' in content_type or is_pdf:
+                with fitz.open(stream=response.content, filetype="pdf") as pdf_doc:
+                    for page in pdf_doc:
+                        page_text += page.get_text() + " "
+            else:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                for element in soup(['script', 'style', 'nav', 'footer', 'header']):
+                    element.decompose()
+                page_text = soup.get_text(separator=' ', strip=True)
+
+            if not page_text.strip():
+                return "Could not extract meaningful text from the document."
+
+            summarization_prompt = f"Please provide a concise, 2-3 sentence summary of the following document content:\n\n{page_text[:8000]}"
+            
+            summary_resp = generate_content_with_failover(
+                [{'role': 'user', 'parts': [{'text': summarization_prompt}]}],
+                system_instruction="You are a text summarizer. Your only job is to provide a concise summary of the text given to you.",
+                generation_config=genai.types.GenerationConfig(temperature=0.4)
+            )
+            
+            app.logger.info("Successfully generated summary.")
+            return summary_resp.candidates[0].content.parts[0].text
+            
+        except Exception as e:
+            app.logger.error(f"Error during summarization process: {e}", exc_info=True)
+            return "An error occurred while trying to summarize the document."
+    
+    else:
+        app.logger.info("URL is not from an allowed domain. Denying summarization.")
+        return "This document cannot be summarized."
 
 
 # --- Routes ---
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    db_ok = False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+    
+    status_code = 200 if db_ok else 503
+    return jsonify({"app": "up", "db": db_ok}), status_code
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -156,16 +278,17 @@ def chat():
 
     try:
         conversation_history = history + [{'role': 'user', 'parts': [{'text': user_message}]}]
+        generation_config = genai.types.GenerationConfig(temperature=0.2)
 
         response = generate_content_with_failover(
             conversation_history,
             tools=[search_tool],
-            system_instruction=SYSTEM_PROMPT
+            system_instruction=SYSTEM_PROMPT,
+            generation_config=generation_config
         )
         
         response_part = response.candidates[0].content.parts[0]
 
-        # Use the correct, functional logic for handling the tool call
         if response_part and getattr(response_part, 'function_call', None) and response_part.function_call.name == "search_database":
             params = {k: v for k, v in response_part.function_call.args.items()}
             documents = search_database(**params)
@@ -182,14 +305,27 @@ def chat():
                     "message": "I couldn't find any documents that match your request."
                 })
         else:
-            # Safely get the text from the response for conversational replies
             response_text = response_part.text if response_part and hasattr(response_part, 'text') else response.text
             return jsonify({"type": "conversation", "message": response_text})
 
     except Exception as e:
-        print(f"Error in /chat: {e}")
+        app.logger.error(f"Error in /chat: {e}", exc_info=True)
         return jsonify({"error": "An error occurred while processing your request."}), 500
+
+@app.route('/summarize', methods=['POST'])
+def summarize():
+    data = request.json or {}
+    url = data.get('url')
+    if not url:
+        return jsonify({'status': 'error', 'message': 'No URL provided.'}), 200
+    
+    summary = fetch_and_summarize_document(url)
+    
+    if "cannot be summarized" in summary or "An error occurred" in summary:
+        return jsonify({'status': 'error', 'message': summary}), 200
+
+    return jsonify({'status': 'success', 'summary': summary})
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run()
