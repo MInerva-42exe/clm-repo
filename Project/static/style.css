@@ -1,25 +1,18 @@
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
+/* --- NEW: Color Palette based on your reference image --- */
 :root {
-    --background-color: #121212; /* Off-black */
-    --surface-color: #1E1E1E;    /* Dark Gray */
-    --primary-accent: #FFC107;   /* Golden Yellow */
-    --primary-accent-hover: #FFD54F;
-    --text-primary: #EAEAEA;
-    --text-secondary: #A0A0A0;
-    --border-color: #2c2c2c;
-    
-    /* Highlights */
-    --highlight-red: #E53935;
-    --highlight-green: #43A047;
-    --highlight-blue: #1E88E5;
+    --background-color: #F8FAFC;      /* Light Gray/White Content Area */
+    --surface-color: #FFFFFF;         /* White for cards */
+    --primary-accent: #16A34A;        /* Vibrant Green */
+    --primary-accent-hover: #15803D;
+    --header-background: #1E293B;     /* Dark Blue/Charcoal Sidebar/Header */
+    --text-primary: #1E293B;          /* Dark Text */
+    --text-secondary: #64748B;        /* Medium Gray Text */
+    --border-color: #E2E8F0;
 }
 
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
     font-family: 'Plus Jakarta Sans', sans-serif;
@@ -28,8 +21,6 @@ body {
     display: flex;
     justify-content: center;
     height: 100vh;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
 }
 
 .chat-container {
@@ -38,20 +29,23 @@ body {
     width: 100%;
     max-width: 800px;
     height: 100%;
-    background-color: var(--background-color);
+    background-color: var(--surface-color);
+    border-left: 1px solid var(--border-color);
+    border-right: 1px solid var(--border-color);
 }
 
 .app-header {
     text-align: center;
-    padding: 1.5rem 1rem;
+    padding: 1.25rem 1rem;
     flex-shrink: 0;
-    border-bottom: 1px solid var(--border-color);
+    border-bottom: 1px solid #334155; /* Darker border for the header */
+    background-color: var(--header-background);
 }
 
 .app-header h1 {
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: var(--primary-accent);
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #FFFFFF; /* White text on dark header */
 }
 
 .chat-window {
@@ -60,13 +54,14 @@ body {
     padding: 1.5rem;
     display: flex;
     flex-direction: column;
-    gap: 1.5rem;
+    gap: 1rem;
+    background-color: var(--background-color);
 }
 
 .chat-message {
     display: flex;
     max-width: 85%;
-    animation: fadeIn 0.5s ease-in-out;
+    animation: fadeIn 0.4s ease-out;
 }
 .user-message {
     margin-left: auto;
@@ -76,37 +71,38 @@ body {
 }
 .message-content {
     background-color: var(--surface-color);
-    padding: 1rem 1.25rem;
+    padding: 0.8rem 1.2rem;
     border-radius: 1rem;
     line-height: 1.6;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
 }
 .user-message .message-content {
     background-color: var(--primary-accent);
-    color: #121212;
-    font-weight: 500;
+    color: #FFFFFF;
+    border: none;
     border-radius: 1rem 1rem 0.25rem 1rem;
 }
-.message-content p {
-    margin: 0;
-}
+.message-content p { margin: 0; }
 
 .search-footer {
-    padding: 1.5rem;
+    padding: 1rem 1.5rem;
     flex-shrink: 0;
+    background-color: var(--surface-color);
     border-top: 1px solid var(--border-color);
 }
 .search-container {
     display: flex;
     align-items: center;
-    background-color: var(--surface-color);
-    border-radius: 0.75rem;
-    padding: 0.5rem;
+    background-color: var(--background-color);
+    border-radius: 0.5rem;
+    padding: 0.25rem 0.25rem 0.25rem 1rem;
     border: 1px solid var(--border-color);
-    transition: all 0.3s ease;
+    transition: all 0.2s ease;
 }
 .search-container:focus-within {
     border-color: var(--primary-accent);
-    box-shadow: 0 0 10px rgba(255, 193, 7, 0.2);
+    box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
 }
 #queryInput {
     flex-grow: 1;
@@ -115,73 +111,79 @@ body {
     background: none;
     color: var(--text-primary);
     font-size: 1rem;
-    padding: 0.5rem;
+    padding: 0.5rem 0;
 }
 #searchButton {
     background-color: var(--primary-accent);
     border: none;
-    color: #121212;
+    color: #FFFFFF;
     cursor: pointer;
-    padding: 0.75rem;
-    border-radius: 0.5rem;
+    padding: 0.6rem 1rem;
+    border-radius: 0.375rem;
     display: flex;
     align-items: center;
     justify-content: center;
     transition: background-color 0.2s;
+    margin-left: 0.5rem;
 }
 #searchButton:hover {
     background-color: var(--primary-accent-hover);
 }
 
-/* Document Card Styling */
 .doc-card {
     background-color: var(--surface-color);
     border: 1px solid var(--border-color);
-    border-radius: 0.75rem;
+    border-radius: 0.5rem;
     padding: 1.25rem;
     margin-top: 1rem;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
 }
-.card-header h3 {
-    margin: 0 0 0.75rem 0;
-    font-size: 1.1rem;
-    font-weight: 600;
-    color: var(--text-primary);
-}
+.card-header h3 { margin: 0 0 0.75rem 0; font-size: 1.1rem; font-weight: 600; }
 .tags { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
-.tag { padding: 0.3rem 0.8rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; color: #fff;}
-.tag-blue { background-color: var(--highlight-blue); }
-.tag-green { background-color: var(--highlight-green); }
-.tag-red { background-color: var(--highlight-red); }
-.tag-gray { background-color: #4A4A4A; color: #B0BEC5; }
-
+.tag { padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.75rem; font-weight: 500; }
+.tag-blue { background-color: #EFF6FF; color: #1D4ED8; border: 1px solid #DBEAFE;}
+.tag-gray { background-color: #F1F5F9; color: #334155; border: 1px solid #E2E8F0;}
 .card-body p { font-size: 0.95rem; color: var(--text-secondary); }
 .card-footer { display: flex; justify-content: flex-end; gap: 0.75rem; padding-top: 1.25rem; border-top: 1px solid var(--border-color); margin-top: 1.25rem; }
 
-/* Button Styling */
 .button-primary, .button-secondary {
     padding: 0.5rem 1rem;
     font-size: 0.875rem;
-    font-weight: 600;
+    font-weight: 500;
     border-radius: 0.375rem;
     border: 1px solid transparent;
     cursor: pointer;
     text-decoration: none;
     transition: all 0.2s;
 }
-.button-primary { background-color: var(--primary-accent); color: #121212; }
+.button-primary { background-color: var(--primary-accent); color: #FFFFFF; }
 .button-primary:hover { background-color: var(--primary-accent-hover); }
-.button-primary:disabled { background-color: #333; color: #666; cursor: not-allowed; }
-.button-secondary { background: none; color: var(--text-secondary); border-color: var(--border-color); }
-.button-secondary:hover { border-color: var(--primary-accent); color: var(--primary-accent); }
+.button-secondary { background: none; color: var(--text-primary); border: 1px solid var(--border-color); }
+.button-secondary:hover { border-color: var(--text-primary); background-color: var(--background-color); }
 
-.error {
-    color: var(--highlight-red);
-    font-weight: 500;
+.loading-state {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    color: var(--text-secondary);
 }
+.spinner {
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--border-color);
+    border-top-color: var(--primary-accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+.error { color: #DC2626; }
+.context-container { background-color: #F0FDF4; border-left: 4px solid var(--primary-accent); padding: 1rem; border-radius: 0.375rem; font-size: 0.9rem; color: #166534; line-height: 1.5; }
+.context-container.error { background-color: #FEF2F2; border-left-color: #DC2626; color: #991B1B; }
+.context-container strong { font-weight: 600; color: #15803D; }
 
 @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .chat-window::-webkit-scrollbar { width: 8px; }
 .chat-window::-webkit-scrollbar-track { background: var(--background-color); }
-.chat-window::-webkit-scrollbar-thumb { background-color: var(--surface-color); border-radius: 4px; }
-.chat-window::-webkit-scrollbar-thumb:hover { background-color: #555; }
+.chat-window::-webkit-scrollbar-thumb { background-color: #D1D5DB; border-radius: 4px; border: 2px solid var(--background-color); }
+.chat-window::-webkit-scrollbar-thumb:hover { background-color: #9CA3AF; }
