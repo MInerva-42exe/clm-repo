@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSM Content Repository</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="chat-container">
+        <header class="app-header">
+            <h1>WSM Content Repository</h1>
+        </header>
+
+        <main id="chat-window" class="chat-window">
+            <div class="initial-message">
+                <p>How can I help you today?</p>
+            </div>
+        </main>
+
+        <footer class="search-footer">
+            <div class="search-container">
+                <input type="text" id="queryInput" placeholder="Ask about a product, document type, or keyword...">
+                <button id="searchButton" aria-label="Send">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <script>
+        const queryInput = document.getElementById('queryInput');
+        const searchButton = document.getElementById('searchButton');
+        const chatWindow = document.getElementById('chat-window');
+        const chatContainer = document.querySelector('.chat-container');
+
+        searchButton.addEventListener('click', performSearch);
+        queryInput.addEventListener('keypress', function(event) {
+            if (event.key === 'Enter') {
+                performSearch();
+            }
+        });
+
+        function appendUserMessage(query) {
+            const userMessage = document.createElement('div');
+            userMessage.classList.add('chat-message', 'user-message');
+            userMessage.innerHTML = `<div class="message-content"><p>${query}</p></div>`;
+            chatWindow.appendChild(userMessage);
+        }
+
+        function appendBotMessage(content) {
+            const botMessage = document.createElement('div');
+            botMessage.classList.add('chat-message', 'bot-message');
+            botMessage.innerHTML = content;
+            chatWindow.appendChild(botMessage);
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+        }
+
+        function performSearch() {
+            const query = queryInput.value.trim();
+            if (!query) return;
+            
+            chatContainer.classList.add('has-messages');
+
+            const initialMessage = document.querySelector('.initial-message');
+            if (initialMessage) {
+                initialMessage.remove();
+            }
+
+            appendUserMessage(query);
+            queryInput.value = '';
+
+            const loadingIndicator = `
+                <div class="message-content">
+                    <div class="loading-state">
+                        <div class="spinner"></div>
+                        <span>Searching...</span>
+                    </div>
+                </div>
+            `;
+            appendBotMessage(loadingIndicator);
+
+            fetch('/search', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: query })
+            })
+            .then(response => response.json())
+            .then(data => {
+                chatWindow.removeChild(chatWindow.lastChild);
+
+                if (data.error) {
+                    appendBotMessage(`<div class="message-content error"><p>Error: ${data.error}</p></div>`);
+                    return;
+                }
+                if (data.length === 0) {
+                    appendBotMessage(`<div class="message-content"><p>No documents found. Please try a different search term.</p></div>`);
+                } else {
+                    const resultsHTML = data.map((doc, index) => {
+                        const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
+                        const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
+                        
+                        // **FIX:** The link is now stored in a data-url attribute for safety.
+                        return `
+                            <div class="doc-card">
+                                <div class="card-header">
+                                    <h3>${doc.Content_Title || 'Untitled Document'}</h3>
+                                    <div class="tags">${productHTML}${docTypeHTML}</div>
+                                </div>
+                                <div class="card-body"><p>${doc.Description || 'No description available.'}</p></div>
+                                <div class="card-footer">
+                                    <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
+                                    <button class="button-primary summarize-btn" 
+                                            data-url="${doc.Link}" 
+                                            onclick="getSummary(this, 'context-${index}')">Summarize</button>
+                                </div>
+                                <div class="context-wrapper" id="context-${index}"></div>
+                            </div>
+                        `;
+                    }).join('');
+                    appendBotMessage(`<div class="message-content">${resultsHTML}</div>`);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                chatWindow.removeChild(chatWindow.lastChild);
+                appendBotMessage(`<div class="message-content error"><p>An error occurred while fetching results.</p></div>`);
+            });
+        }
+
+        // **FIX:** The function now gets the URL from the button's data attribute.
+        function getSummary(button, contextId) {
+            const url = button.getAttribute('data-url');
+            const contextWrapper = document.getElementById(contextId);
+            
+            button.disabled = true;
+            button.textContent = 'Summarizing...';
+            contextWrapper.innerHTML = '';
+
+            fetch('/summarize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: url })
+            })
+            .then(response => response.json())
+            .then(data => {
+                contextWrapper.innerHTML = `<div class="context-container"><strong>Context:</strong> ${data.summary}</div>`;
+                button.style.display = 'none';
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                contextWrapper.innerHTML = `<div class="context-container error">Failed to get summary.</div>`;
+                button.disabled = false;
+                button.textContent = 'Summarize';
+            });
+        }
+    </script>
+</body>
+</html>

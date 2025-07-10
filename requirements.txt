@@ -1,0 +1,6 @@
+Flask
+requests
+beautifulsoup4
+PyMuPDF
+google-generativeai
+gunicorn
