@@ -17,7 +17,7 @@ import fitz # PyMuPDF
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
-# UPDATED: Using your live Render URL for CORS
+# For production, replace "*" with your frontend's exact origin
 CORS(app, resources={
     r"/chat": {"origins": "https://clm-repo.onrender.com"},
     r"/summarize": {"origins": "https://clm-repo.onrender.com"},
@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in .env file.")
-# echo=False is best for production to avoid noisy logs
-engine = create_engine(DATABASE_URL, echo=False)
+# UPDATED: Added pool_pre_ping=True to handle serverless DB connections
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 try:
     with engine.connect() as conn:
