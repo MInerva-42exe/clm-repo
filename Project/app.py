@@ -48,6 +48,7 @@ if not GEMINI_API_KEYS:
 api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
+
 def generate_content_with_failover(*args, **kwargs):
     for _ in range(len(GEMINI_API_KEYS)):
         try:
@@ -67,6 +68,7 @@ def generate_content_with_failover(*args, **kwargs):
             app.logger.warning(f"Key failed: {e}. Rotating key.")
             genai.configure(api_key=next(api_key_cycler))
     raise RuntimeError("All Gemini API keys failed.")
+
 
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
@@ -110,15 +112,11 @@ Your sole job when users ask for documents is to call the `search_database` tool
 1. PRODUCT NORMALIZATION (highest priority)
    - Map any product name or acronym to its canonical form using:
      {json.dumps(PRODUCT_ACRONYM_MAP)}
-   - ⚠️ Important: Do not guess or substitute products that are not listed. 
-     For example, do not confuse "AD360" with "Log360", even if they sound similar.
-   - Only use exact matches or listed acronyms.
 2. DOCUMENT-TYPE MAPPING
    - Map user requests to one of:
      {json.dumps(VALID_DOC_TYPES)}
 3. KEYWORD EXTRACTION
    - Pull out 2–5 core phrases that capture user intent.
-     E.g. “Active Directory user provisioning” → ["active directory", "user provisioning"]
 
 === 2. DECISION LOGIC ===
 - **If the user is clearly asking for documents**, immediately call the `search_database` tool.
@@ -136,10 +134,7 @@ def search_database(product=None, document_type=None, keywords=None):
 
 def _search_database(product: str = None, document_type: str = None, keywords: list = None):
     app.logger.info(f"VECTOR SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
-
-    query_text = " ".join(keywords or []).strip()
-    if not query_text:
-        query_text = f"{product or ''} {document_type or ''}".strip()
+    query_text = " ".join(keywords or []).strip() or f"{product or ''} {document_type or ''}".strip()
     if not query_text:
         return []
 
@@ -154,55 +149,144 @@ def _search_database(product: str = None, document_type: str = None, keywords: l
         app.logger.error(f"Failed to embed search query: {e}")
         return []
 
-    base_sql = """SELECT id, title, summary, url, product, document_type
-                  FROM content
-                  ORDER BY 1"""  # Replace with proper vector similarity logic
+    base_sql = """
+        SELECT "Product", "Doc_type", "Content_Title", "Description", "Link",
+               1 - (embedding <=> :query_embedding) AS similarity
+        FROM content_repo
+        WHERE embedding IS NOT NULL
+    """
+    filters = []
+    params = {"query_embedding": json.dumps(query_embedding)}
 
-    with engine.connect() as conn:
-        result = conn.execute(text(base_sql)).fetchall()
-        return [dict(row._mapping) for row in result]
+    if product:
+        variants = [product] + PRODUCT_ACRONYM_MAP.get(product, [])
+        params["product_variants"] = [f"%{v}%" for v in variants]
+        filters.append('"Product" ILIKE ANY(:product_variants)')
+
+    if document_type:
+        filters.append('"Doc_type" ILIKE :doc_type')
+        params["doc_type"] = f"%{document_type}%"
+
+    if filters:
+        base_sql += " AND " + " AND ".join(filters)
+    base_sql += " ORDER BY similarity DESC LIMIT 10"
+
+    try:
+        with engine.connect() as conn:
+            cursor = conn.execute(text(base_sql), params)
+            return [dict(row._mapping) for row in cursor.fetchall()]
+    except Exception as e:
+        app.logger.error(f"Database vector search error: {e}", exc_info=True)
+        return []
+
+# --- Document Summarization ---
+def fetch_and_summarize_document(url):
+    app.logger.info(f"Attempting to summarize URL: {url}")
+    if 'workdrive' in url:
+        return "This is an internal document and cannot be summarized."
+
+    is_allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url
+    is_pdf = url.lower().endswith('.pdf')
+
+    if is_allowed_domain or is_pdf:
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
+            response.raise_for_status()
+
+            page_text = ""
+            content_type = response.headers.get('Content-Type', '').lower()
+
+            if 'application/pdf' in content_type or is_pdf:
+                with fitz.open(stream=response.content, filetype="pdf") as pdf_doc:
+                    for page in pdf_doc:
+                        page_text += page.get_text() + " "
+            else:
+                soup = BeautifulSoup(response.content, 'html.parser')
+                for element in soup(['script', 'style', 'nav', 'footer', 'header']):
+                    element.decompose()
+                page_text = soup.get_text(separator=' ', strip=True)
+
+            if not page_text.strip():
+                return "Could not extract meaningful text from the document."
+
+            summarization_prompt = f"Please provide a concise, 2-3 sentence summary of the following document content:\n\n{page_text[:8000]}"
+            summary_resp = generate_content_with_failover(
+                [{'role': 'user', 'parts': [{'text': summarization_prompt}]}],
+                system_instruction="You are a text summarizer.",
+                generation_config=genai.types.GenerationConfig(temperature=0.4)
+            )
+            return summary_resp.candidates[0].content.parts[0].text
+        except Exception as e:
+            app.logger.error(f"Error during summarization process: {e}", exc_info=True)
+            return "An error occurred while trying to summarize the document."
+    else:
+        return "This document cannot be summarized."
 
 # --- Routes ---
-@app.route("/chat", methods=["POST"])
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "message": "WSM Content Assistant API is running.",
+        "endpoints": {
+            "POST /chat": "Send a message to the assistant",
+            "POST /summarize": "Summarize a document",
+            "GET /health": "Health check"
+        }
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({"app": "up", "db": True}), 200
+    except Exception:
+        return jsonify({"app": "up", "db": False}), 503
+
+@app.route('/chat', methods=['POST'])
 def chat():
-    user_input = request.json.get("message", "")
-    if not user_input:
-        return jsonify({"error": "Missing 'message'"}), 400
+    data = request.json or {}
+    user_message = data.get('message', '').strip()
+    history = data.get('history', [])
 
-    chat_session = generate_content_with_failover(
-        [user_input],
-        tools=[search_tool],
-        system_instruction=SYSTEM_PROMPT,
-    )
+    if not user_message:
+        return jsonify({"error": "No message provided."}), 400
 
-    for response_part in chat_session:
-        if response_part.candidates and response_part.candidates[0].content.parts:
-            part = response_part.candidates[0].content.parts[0]
-            if part.function_call:
-                params = {k: v for k, v in part.function_call.args.items()}
+    try:
+        conversation_history = (history + [{'role': 'user', 'parts': [{'text': user_message}]}])[-4:]
+        response = generate_content_with_failover(
+            conversation_history,
+            tools=[search_tool],
+            system_instruction=SYSTEM_PROMPT,
+            generation_config=genai.types.GenerationConfig(temperature=0.2)
+        )
 
-                # ✅ Product validation
-                product_name = params.get("product")
-                if product_name:
-                    app.logger.info(f"Gemini interpreted product as: {product_name}")
-                    if product_name not in PRODUCT_ACRONYM_MAP:
-                        app.logger.warning(f"Gemini returned unknown or incorrect product: {product_name}")
-                        return jsonify({
-                            "type": "conversation",
-                            "message": "I'm not sure which product you're referring to. Could you please clarify?"
-                        })
+        part = response.candidates[0].content.parts[0]
+        if getattr(part, 'function_call', None) and part.function_call.name == "search_database":
+            documents = search_database(**part.function_call.args)
+            if documents:
+                return jsonify({"type": "documents", "message": f"I found {len(documents)} document(s) for you:", "data": documents})
+            return jsonify({"type": "conversation", "message": "I couldn't find any documents that match your request."})
+        return jsonify({"type": "conversation", "message": getattr(part, 'text', 'I’m not sure how to respond.')})
 
-                documents = search_database(**params)
-                return jsonify({"type": "documents", "results": documents})
+    except Exception as e:
+        app.logger.error(f"Error in /chat: {e}", exc_info=True)
+        return jsonify({"error": "An error occurred while processing your request."}), 500
 
-    final_text = chat_session.text.strip()
-    return jsonify({"type": "conversation", "message": final_text})
-
-@app.route("/summarize", methods=["POST"])
+@app.route('/summarize', methods=['POST'])
 def summarize():
-    # Stub
-    return jsonify({"summary": "Summary coming soon."})
+    data = request.json or {}
+    url = data.get('url')
+    if not url:
+        return jsonify({'status': 'error', 'message': 'No URL provided.'}), 200
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+    summary = fetch_and_summarize_document(url)
+    if "cannot be summarized" in summary or "An error occurred" in summary:
+        return jsonify({'status': 'error', 'message': summary}), 200
+
+    return jsonify({'status': 'success', 'summary': summary})
+
+
+if __name__ == '__main__':
+    app.run()
