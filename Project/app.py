@@ -2,6 +2,7 @@ import os
 import json
 from itertools import cycle
 import logging
+from functools import lru_cache
 
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
@@ -17,7 +18,6 @@ import fitz # PyMuPDF
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
-# For production, replace "*" with your frontend's exact origin
 CORS(app, resources={
     r"/chat": {"origins": "https://clm-repo.onrender.com"},
     r"/summarize": {"origins": "https://clm-repo.onrender.com"},
@@ -30,7 +30,6 @@ logging.basicConfig(level=logging.INFO)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in .env file.")
-# echo=False is best for production to avoid noisy logs. pool_pre_ping is essential for serverless DBs.
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 try:
@@ -53,10 +52,6 @@ genai.configure(api_key=next(api_key_cycler))
 
 
 def generate_content_with_failover(*args, **kwargs):
-    """
-    A wrapper for model.generate_content that handles API key rotation
-    and passes relevant kwargs directly to the model constructor.
-    """
     for _ in range(len(GEMINI_API_KEYS)):
         try:
             model_kwargs = {
@@ -131,70 +126,71 @@ Your sole job when users ask for documents is to call the `search_database` tool
 - **If the user is clearly asking for documents**, immediately call the `search_database` tool.
 - **If details are missing or ambiguous**, ask a follow-up question.
 - **Otherwise**, carry on the conversation as normal.
-
-=== 3. EXAMPLES ===
-1. **Greeting**
-   User: “hi”
-   → “Hello! Which product or document type are you interested in?”
-
-2. **Acronym Lookup**
-   User: “show me ADMP docs”
-   → tool call with `product="ADManager Plus"`
-
-3. **Whitepaper Request**
-   User: “any whitepapers on m365 manager plus?”
-   → tool call with `document_type="E-book or guide"`
-
-4. **Vague Guide Request**
-   User: “I need a guide.”
-   → “Sure—what product is the guide for?”
-
-5. **Complex Query**
-   User: “Find technical docs about security compliance in ADAudit Plus”
-   → tool call with `product="ADAudit Plus"`, `document_type="Technical Document"`, `keywords=["security compliance"]`
-
-6. **Follow-up**
-   History: previous search for AD360
-   User: “Now just the case studies.”
-   → tool call with `product="AD360"`, `document_type="Case study"`
 """
 
 
-def search_database(product: str = None, document_type: str = None, keywords: list = None):
-    """Searches the database for documents with the given parameters."""
-    app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
-    
-    conditions, params = [], {}
-    if product:
-        conditions.append('"Product" ILIKE :product')
-        params['product'] = f"%{product}%"
-    if document_type:
-        conditions.append('"Doc_type" ILIKE :doc_type')
-        params['doc_type'] = f"%{document_type}%"
-    if keywords:
-        keyword_conditions = []
-        for i, keyword in enumerate(keywords):
-            param_name = f"keyword_{i}"
-            keyword_search_clause = (f'("Content_Title" ILIKE :{param_name} OR "Description" ILIKE :{param_name} OR "Generated_Keywords" ILIKE :{param_name})')
-            keyword_conditions.append(keyword_search_clause)
-            params[param_name] = f"%{keyword}%"
-        if keyword_conditions:
-            conditions.append(f"({ ' OR '.join(keyword_conditions) })")
+# --- Semantic Search Implementation ---
+@lru_cache(maxsize=128)
+def _cached_search(product, document_type, keyword_tuple):
+    """Internal cached search function."""
+    return tuple(_search_database(product, document_type, list(keyword_tuple)))
 
-    if not conditions:
+def search_database(product=None, document_type=None, keywords=None):
+    """Public-facing search function that uses the cache."""
+    return list(_cached_search(product or "", document_type or "", tuple(keywords or [])))
+
+def _search_database(product: str = None, document_type: str = None, keywords: list = None):
+    """Searches the database using vector similarity and smart filters."""
+    app.logger.info(f"VECTOR SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    
+    query_text = " ".join(keywords or []).strip()
+    if not query_text:
+        query_text = f"{product or ''} {document_type or ''}".strip()
+    if not query_text:
         return []
 
-    sql_where_clause = " AND ".join(conditions)
+    try:
+        query_embedding = genai.embed_content(
+            model="models/embedding-001",
+            content=query_text,
+            task_type="retrieval_query"
+        )["embedding"]
+    except Exception as e:
+        app.logger.error(f"Failed to embed search query: {e}")
+        return []
+
+    base_sql = """
+        SELECT "Product", "Doc_type", "Content_Title", "Description", "Link",
+               1 - (embedding <=> :query_embedding) AS similarity
+        FROM content_repo
+        WHERE embedding IS NOT NULL
+    """
+
+    filters = []
+    params = {"query_embedding": json.dumps(query_embedding)}
     
+    if product:
+        variants = [product] + PRODUCT_ACRONYM_MAP.get(product, [])
+        params["product_variants"] = [f"%{v}%" for v in variants]
+        filters.append('"Product" ILIKE ANY(:product_variants)')
+
+    if document_type:
+        filters.append('"Doc_type" ILIKE :doc_type')
+        params["doc_type"] = f"%{document_type}%"
+
+    if filters:
+        base_sql += " AND " + " AND ".join(filters)
+
+    base_sql += " ORDER BY similarity DESC LIMIT 10"
+
     try:
         with engine.connect() as conn:
-            query_string = f'SELECT "Product", "Doc_type", "Content_Title", "Description", "Link" FROM content_repo WHERE {sql_where_clause} LIMIT 10'
-            cursor = conn.execute(text(query_string), params)
+            cursor = conn.execute(text(base_sql), params)
             results = [dict(row._mapping) for row in cursor.fetchall()]
-            app.logger.info(f"Found {len(results)} results in the database.")
+            app.logger.info(f"✅ Found {len(results)} vector-based results.")
             return results
     except Exception as e:
-        app.logger.error(f"Database query error: {e}", exc_info=True)
+        app.logger.error(f"Database vector search error: {e}", exc_info=True)
         raise
 
 def fetch_and_summarize_document(url):
@@ -202,14 +198,12 @@ def fetch_and_summarize_document(url):
     app.logger.info(f"Attempting to summarize URL: {url}")
 
     if 'workdrive' in url:
-        app.logger.info("URL is an internal workdrive link. Skipping.")
         return "This is an internal document and cannot be summarized."
 
     is_allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url
     is_pdf = url.lower().endswith('.pdf')
 
     if is_allowed_domain or is_pdf:
-        app.logger.info("URL is allowed. Proceeding with summarization.")
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
             response = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
@@ -239,15 +233,11 @@ def fetch_and_summarize_document(url):
                 generation_config=genai.types.GenerationConfig(temperature=0.4)
             )
             
-            app.logger.info("Successfully generated summary.")
             return summary_resp.candidates[0].content.parts[0].text
-            
         except Exception as e:
             app.logger.error(f"Error during summarization process: {e}", exc_info=True)
             return "An error occurred while trying to summarize the document."
-    
     else:
-        app.logger.info("URL is not from an allowed domain. Denying summarization.")
         return "This document cannot be summarized."
 
 
@@ -281,7 +271,7 @@ def chat():
         return jsonify({"error": "No message provided."}), 400
 
     try:
-        conversation_history = history + [{'role': 'user', 'parts': [{'text': user_message}]}]
+        conversation_history = (history + [{'role': 'user', 'parts': [{'text': user_message}]}])[-4:]
         generation_config = genai.types.GenerationConfig(temperature=0.2)
 
         response = generate_content_with_failover(
@@ -309,7 +299,7 @@ def chat():
                     "message": "I couldn't find any documents that match your request."
                 })
         else:
-            response_text = response_part.text if response_part and hasattr(response_part, 'text') else response.text
+            response_text = getattr(response_part, 'text', '') or getattr(response, 'text', 'I’m not sure how to respond.')
             return jsonify({"type": "conversation", "message": response_text})
 
     except Exception as e:
@@ -330,6 +320,6 @@ def summarize():
 
     return jsonify({'status': 'success', 'summary': summary})
 
+
 if __name__ == '__main__':
-    # Removed debug=True for production
     app.run()
