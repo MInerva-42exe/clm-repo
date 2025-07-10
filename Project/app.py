@@ -153,7 +153,9 @@ def _search_database(product: str = None, document_type: str = None, keywords: l
         query_embedding = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
-            task_type="retrieval_query"
+            task_type="retrieval_query",
+            title="query",
+        output_dimensionality=384
         )["embedding"]
     except Exception as e:
         app.logger.error(f"Failed to embed search query: {e}")
