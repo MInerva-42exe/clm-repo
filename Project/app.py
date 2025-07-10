@@ -330,6 +330,15 @@ def summarize():
 
     return jsonify({'status': 'success', 'summary': summary})
 
+@app.route('/verify-embeddings')
+def verify_embeddings():
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT COUNT(*) FROM content_repo WHERE embedding IS NOT NULL"))
+            count = result.scalar()
+            return jsonify({"rows_with_embeddings": count})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 if __name__ == '__main__':
     # Removed debug=True for production
