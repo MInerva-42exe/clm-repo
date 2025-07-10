@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in .env file.")
-# UPDATED: Added pool_pre_ping=True to handle serverless DB connections
+# echo=False is best for production to avoid noisy logs. pool_pre_ping is essential for serverless DBs.
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 try:
@@ -53,6 +53,10 @@ genai.configure(api_key=next(api_key_cycler))
 
 
 def generate_content_with_failover(*args, **kwargs):
+    """
+    A wrapper for model.generate_content that handles API key rotation
+    and passes relevant kwargs directly to the model constructor.
+    """
     for _ in range(len(GEMINI_API_KEYS)):
         try:
             model_kwargs = {
@@ -328,4 +332,5 @@ def summarize():
 
 
 if __name__ == '__main__':
+    # Removed debug=True for production
     app.run()
