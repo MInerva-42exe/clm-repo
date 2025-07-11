@@ -8,7 +8,6 @@
 <body>
     <div class="chat-container">
         <header class="app-header">
-            <!-- UPDATED: Changed title -->
             <h1>WSM Content Librarian</h1>
         </header>
         <main id="chat-window" class="chat-window">
@@ -87,7 +86,6 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.job_id) {
-                        // UPDATED: Changed loading text
                         const loadingIndicator = appendMessage(`<div class="loading-state"><div class="spinner"></div><span>Processing question...</span></div>`, 'bot');
                         pollForResult(data.job_id, loadingIndicator);
                     } else { throw new Error('Failed to create chat job.'); }
