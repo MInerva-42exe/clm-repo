@@ -41,7 +41,7 @@
                 if (typeof content === 'string') {
                     messageContent.innerHTML = content;
                 } else {
-                    messageContent.innerHTML = content.message;
+                    messageContent.innerHTML = `<p>${content.message}</p>`;
                     if (content.data && content.data.length > 0) {
                         const cardsContainer = document.createElement('div');
                         cardsContainer.classList.add('doc-cards-container');
@@ -57,8 +57,13 @@
             }
 
             function createDocumentCard(doc) {
-                // ... (your createDocumentCard function remains here)
-                return '';
+                const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
+                const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
+                return `<div class="doc-card">
+                            <div class="card-header"><h3>${doc.Content_Title || 'Untitled'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
+                            <div class="card-body"><p>${doc.Description || 'No description.'}</p></div>
+                            <div class="card-footer"><a href="${doc.Link}" target="_blank" class="button-secondary">View</a><button class="button-primary">Summarize</button></div>
+                        </div>`;
             }
 
             function performChat() {
@@ -102,7 +107,7 @@
                                 } else {
                                     let botResponseContent;
                                     if (result.type === 'documents') {
-                                        botResponseContent = { message: `<p>${result.message}</p>`, data: result.data };
+                                        botResponseContent = { message: result.message, data: result.data };
                                         chatHistory.push({ role: 'model', parts: [{ text: result.message }] });
                                     } else {
                                         botResponseContent = `<p>${result.message}</p>`;
@@ -124,7 +129,7 @@
                             console.error('Error polling:', error);
                             appendMessage(`<p class="error">Error checking status.</p>`, 'bot');
                         });
-                }, 2500); // Poll every 2.5 seconds
+                }, 2500);
             }
 
             queryInput.addEventListener('keydown', e => e.key === 'Enter' && performChat());
