@@ -21,8 +21,7 @@ import fitz # PyMuPDF
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
-# Remember to replace "*" with your frontend's exact origin for production
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "https://clm-repo.onrender.com"}})
 logging.basicConfig(level=logging.INFO)
 
 # --- Redis Queue Setup ---
@@ -54,13 +53,39 @@ api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
 
+def generate_content_with_failover(*args, **kwargs):
+    for _ in range(len(GEMINI_API_KEYS)):
+        try:
+            model_kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in ("tools", "system_instruction", "generation_config")
+            }
+            app.logger.debug(f"Calling Gemini with model_kwargs: {list(model_kwargs.keys())}")
+            
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                **model_kwargs
+            )
+            return model.generate_content(*args)
+        except (google.api_core.exceptions.PermissionDenied,
+                google.api_core.exceptions.ResourceExhausted) as e:
+            app.logger.warning(f"Key failed: {e}. Rotating key.")
+            genai.configure(api_key=next(api_key_cycler))
+    raise RuntimeError("All Gemini API keys failed.")
+
+
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"], "ADAudit Plus": ["ADAP"], "ADSelfService Plus": ["ADSSP"],
-    "AD360": ["AD360", "AD 360"]
+    "Recovery Manager Plus": ["RMP"], "Exchange Reporter Plus": ["ERP"], "M365 Manager Plus": ["MMP", "M365MP"],
+    "SharePoint Manager Plus": ["SPMP"], "DataSecurity Plus": ["DSP"], "Identity360": ["ID360"],
+    "AD360": ["AD360", "AD 360", "ManageEngine AD360"],
+    "Log360": ["Log360", "Log 360", "ManageEngine Log360"]
 }
 VALID_DOC_TYPES = [
-    "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other"
+    "Brochure or flyer", "Datasheet", "Presentation", "Technical Document",
+    "Case study", "E-book or guide", "Solution brief", "Video",
+    "Comparison document", "ROI calculator", "Other"
 ]
 
 # --- Tool Definition & System Prompt ---
@@ -78,7 +103,6 @@ search_tool = {
                     "items": {"type": "string"}
                 }
             },
-            # UPDATED: Fields are now optional for more flexibility
             "required": []
         }
     }]
@@ -86,12 +110,32 @@ search_tool = {
 
 
 SYSTEM_PROMPT = f"""
-You are WSM Content Assistant, a function-calling AI that helps users find documents.
-Your job is to analyze user queries and call the `search_database` tool with the appropriate parameters.
-If the user is making small talk, respond conversationally. If a query is too vague, ask for clarification.
+You are WSM Content Assistant, a friendly, conversational AI expert on software documentation.
+Your sole job when users ask for documents is to call the `search_database` tool; otherwise, respond naturally or ask for clarification.
 
-- Product Map: {json.dumps(PRODUCT_ACRONYM_MAP)}
-- Document Types: {json.dumps(VALID_DOC_TYPES)}
+=== 1. INPUT PROCESSING ===
+1. PRODUCT NORMALIZATION (highest priority)
+   - Exact match input to full name or acronym in this map: {json.dumps(PRODUCT_ACRONYM_MAP)}
+   - Map acronyms (e.g. “ADMP”) → full name (“ADManager Plus”).
+2. DOCUMENT-TYPE MAPPING
+   - Restrict to one of: {json.dumps(VALID_DOC_TYPES)}.
+3. KEYWORD EXTRACTION
+   - Extract 2–5 core phrases; avoid stop-words (e.g. “please”, “docs”).
+
+If no documents match the query, do **not** invent titles—return an empty list or ask a follow-up question.
+
+=== 2. DECISION LOGIC ===
+- If the user clearly wants documents, immediately emit a function call in this exact JSON format:
+  {{
+    "name": "search_database",
+    "arguments": {{
+      "product": "...",
+      "document_type": "...",
+      "keywords": ["...", "..."]
+    }}
+  }}
+- If details are missing or ambiguous, ask a targeted follow-up (e.g., “Which product are you interested in?”).
+- Otherwise, continue the conversation in a polite, conversational tone.
 """
 
 # --- Functions for the Worker ---
@@ -105,7 +149,6 @@ def _update_job_progress(message: str):
 @lru_cache(maxsize=128)
 def _cached_search(product, document_type, keyword_tuple):
     results = _search_database(product, document_type, list(keyword_tuple))
-    # Safer handling of None results
     return tuple(results) if results is not None else tuple()
 
 def search_database(product=None, document_type=None, keywords=None):
@@ -122,7 +165,6 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
         return []
 
     try:
-        # Note: Different SDK versions might return resp.embedding instead
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
@@ -160,7 +202,6 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
             app.logger.info(f"Found {len(rows)} results from database.")
             return [dict(row._mapping) for row in rows]
     except Exception as e:
-        # UPDATED: Return empty list on DB error to make the job more resilient
         app.logger.error(f"Database vector search error: {e}", exc_info=True)
         return []
 
@@ -178,7 +219,6 @@ def call_generative_model(conversation_history):
             docs = search_database(**part.function_call.args)
             if docs:
                 return {"type": "documents", "message": f"I found {len(docs)} document(s):", "data": docs}
-            # UPDATED: Clearer message for no results vs. an error
             return {"type": "conversation", "message": "I searched but couldn't find any documents that match your request."}
         
         _update_job_progress("Formatting response...")
@@ -220,10 +260,14 @@ def call_summarize(url):
 
         _update_job_progress("Summarizing content...")
         prompt = f"Please provide a concise, 2-3 sentence summary of the following content:\n\n{page_text[:8000]}"
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        resp_ai = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(temperature=0.4))
+        resp_ai = generate_content_with_failover(
+            [{'role':'user','parts':[{'text':prompt}]}],
+            system_instruction="You are a text summarizer.",
+            generation_config=genai.types.GenerationConfig(temperature=0.4)
+        )
         
-        return {"status": "success", "summary": resp_ai.text}
+        summary_text = resp_ai.candidates[0].content.parts[0].text
+        return {"status": "success", "summary": summary_text}
     except Exception as e:
         app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
         return {"status": "error", "message": "An error occurred during summarization."}
@@ -267,7 +311,6 @@ def get_result(job_id):
             return jsonify({'status': 'pending', 'progress': job.meta.get('progress', 'Processing...')})
     return jsonify({'status': 'not_found'}), 404
 
-# --- UPDATED: Summarize endpoint now correctly enqueues the job ---
 @app.route("/summarize", methods=["POST"])
 def summarize():
     data = request.get_json() or {}
@@ -275,7 +318,13 @@ def summarize():
     if not url:
         return jsonify({"error":"No URL provided."}), 400
 
-    job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
+    job = q.enqueue(
+        call_summarize,
+        args=[url],
+        retry=Retry(max=1),
+        job_timeout='5m',
+        result_ttl=600
+    )
     app.logger.info(f"Enqueued summarization job {job.id} for URL: {url}")
     return jsonify({'job_id': job.id})
 
