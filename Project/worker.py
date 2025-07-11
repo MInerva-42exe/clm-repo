@@ -17,8 +17,9 @@ listen = ['default']
 conn = Redis.from_url(REDIS_URL)
 
 if __name__ == '__main__':
-    # The 'Connection' context manager is no longer needed in newer versions of RQ.
-    # We can create the worker directly.
-    worker = Worker(map(Queue, listen), connection=conn)
+    # UPDATED: Create the list of queues correctly, passing the connection to each.
+    queues = [Queue(name, connection=conn) for name in listen]
+    
+    worker = Worker(queues, connection=conn)
     print("Background worker started...")
     worker.work()
