@@ -13,7 +13,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from redis import Redis
 from rq import Queue, get_current_job
-from rq.job import Retry, Job
+from rq.job import Retry
+import requests
+from bs4 import BeautifulSoup
+import fitz  # PyMuPDF
 
 # --- Setup ---
 load_dotenv()
@@ -53,11 +56,34 @@ genai.configure(api_key=next(api_key_cycler))
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"], "ADAudit Plus": ["ADAP"], "ADSelfService Plus": ["ADSSP"],
-    "AD360": ["AD360", "AD 360"]
+    "Recovery Manager Plus": ["RMP"], "Exchange Reporter Plus": ["ERP"], "M365 Manager Plus": ["MMP", "M365MP"],
+    "SharePoint Manager Plus": ["SPMP"], "DataSecurity Plus": ["DSP"], "Identity360": ["ID360"],
+    "AD360": ["AD360", "AD 360", "ManageEngine AD360"],
+    "Log360": ["Log360", "Log 360", "ManageEngine Log360"]
 }
 VALID_DOC_TYPES = [
-    "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other"
+    "Brochure or flyer", "Datasheet", "Presentation", "Technical Document",
+    "Case study", "E-book or guide", "Solution brief", "Video",
+    "Comparison document", "ROI calculator", "Other"
 ]
+
+# --- Normalization Helpers ---
+def normalize_product(product: str) -> str:
+    """Map any acronym or variant back to the canonical full product name."""
+    product = product.strip()
+    for full_name, acronyms in PRODUCT_ACRONYM_MAP.items():
+        if product.lower() == full_name.lower() or product in acronyms:
+            return full_name
+    return product
+
+
+def normalize_document_type(doc_type: str) -> str:
+    """Map incoming doc_type to one of the VALID_DOC_TYPES if it matches."""
+    doc_type = doc_type.strip().lower()
+    for valid in VALID_DOC_TYPES:
+        if doc_type == valid.lower() or doc_type in valid.lower():
+            return valid
+    return doc_type
 
 # --- Tool Definition & System Prompt ---
 search_tool = {
@@ -100,21 +126,86 @@ def _cached_search(product, document_type, keyword_tuple):
     results = _search_database(product, document_type, list(keyword_tuple))
     return tuple(results) if results is not None else tuple()
 
+
 def search_database(product=None, document_type=None, keywords=None):
-    # This public-facing function can be simplified if normalization happens in the worker
-    return list(_cached_search(product or "", document_type or "", tuple(keywords or [])))
+    """Public-facing search function that normalizes inputs, then uses the cache."""
+    normalized_product = normalize_product(product or "")
+    normalized_doc_type = normalize_document_type(document_type or "")
+    key = (
+        normalized_product,
+        normalized_doc_type,
+        tuple(sorted(keywords or []))
+    )
+    return list(_cached_search(*key))
+
 
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
-    # Your full semantic search logic is here
-    pass
+    """Searches the database using vector similarity on title, description, and metadata filters."""
+    app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    keywords = keywords or []
+    query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
+    if not query_text:
+        return []
+
+    # 1. Generate embedding via Gemini
+    try:
+        resp = genai.embed_content(
+            model="models/embedding-001",
+            content=query_text,
+            task_type="retrieval_query",
+            output_dimensionality=384
+        )
+        embedding = resp['embedding']
+    except Exception as e:
+        app.logger.error(f"Failed to embed search query: {e}")
+        return []
+
+    # 2. Perform semantic search in Postgres
+    sql = text(
+        """
+        SELECT "Content_Title","Description","Product","Doc_type","Link"
+        FROM content_repo
+        WHERE embedding IS NOT NULL
+          AND (:product = '' OR "Product" ILIKE :prod)
+          AND (:doc_type = '' OR "Doc_type" ILIKE :dtype)
+        ORDER BY embedding <=> :emb
+        LIMIT 10
+        """
+    )
+    params = {
+        'emb': json.dumps(embedding),
+        'product': product,
+        'prod': f"%{product}%",
+        'doc_type': document_type,
+        'dtype': f"%{document_type}%"
+    }
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(sql, params)
+            rows = result.fetchall()
+            app.logger.info(f"Found {len(rows)} results from database.")
+            return [dict(row._mapping) for row in rows]
+    except Exception as e:
+        app.logger.error(f"Database semantic search error: {e}", exc_info=True)
+        return []
+
+
 
 def call_generative_model(conversation_history):
     """This function is executed by the background worker for chat."""
     app.logger.info("WORKER: Received chat job.")
     try:
         _update_job_progress("Analyzing request...")
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT, tools=[search_tool])
-        response = model.generate_content(conversation_history, generation_config=genai.types.GenerationConfig(temperature=0.1))
+        model = genai.GenerativeModel(
+            'gemini-1.5-flash',
+            system_instruction=SYSTEM_PROMPT,
+            tools=[search_tool]
+        )
+        response = model.generate_content(
+            conversation_history,
+            generation_config=genai.types.GenerationConfig(temperature=0.1)
+        )
         part = response.candidates[0].content.parts[0]
 
         if getattr(part, "function_call", None):
@@ -123,16 +214,57 @@ def call_generative_model(conversation_history):
             if docs:
                 return {"type": "documents", "message": f"I found {len(docs)} document(s):", "data": docs}
             return {"type": "conversation", "message": "I searched, but couldn't find any documents that match your request."}
-        
+
         _update_job_progress("Formatting response...")
         return {"type": "conversation", "message": getattr(part, "text", "I’m not sure how to respond.")}
     except Exception as e:
         app.logger.error(f"WORKER ERROR in call_generative_model: {e}", exc_info=True)
         return {"error": "An error occurred while analyzing your request."}
 
+
 def call_summarize(url):
-    # Your full summarization logic goes here
-    pass
+    """This function is executed by the background worker for summarization."""
+    app.logger.info(f"WORKER: Starting summarization for {url}")
+    _update_job_progress("Fetching document content...")
+
+    if 'workdrive' in url:
+        return {"status": "error", "message": "This is an internal document and cannot be summarized."}
+
+    allowed = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
+    if not allowed:
+        return {"status": "error", "message": "This document cannot be summarized."}
+
+    try:
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        resp.raise_for_status()
+        ct = resp.headers.get('Content-Type', '').lower()
+        text_content = ""
+        if 'application/pdf' in ct or url.lower().endswith('.pdf'):
+            with fitz.open(stream=resp.content, filetype="pdf") as pdf:
+                for page in pdf:
+                    text_content += page.get_text() + " "
+        else:
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            for tag in soup(['script','style','nav','footer','header']): tag.decompose()
+            text_content = soup.get_text(separator=' ', strip=True)
+
+        if not text_content.strip():
+            return {"status": "error", "message": "Could not extract meaningful text."}
+
+        _update_job_progress("Summarizing content...")
+        prompt = f"Please provide a concise, 2-3 sentence summary of the following content:
+
+{text_content[:8000]}"
+        resp_ai = genai.GenerativeModel('gemini-1.5-flash').generate_content(
+            [{'role':'user','parts':[{'text':prompt}]}],
+            generation_config=genai.types.GenerationConfig(temperature=0.4)
+        )
+        summary = resp_ai.candidates[0].content.parts[0].text
+        return {"status": "success", "summary": summary}
+    except Exception as e:
+        app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
+        return {"status": "error", "message": "An error occurred during summarization."}
+
 
 # --- Routes ---
 @app.route("/")
@@ -142,58 +274,49 @@ def serve_frontend():
 @app.route("/health")
 def health_check():
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        with engine.connect() as conn: conn.execute(text("SELECT 1"))
         return jsonify({"app":"up","db":True}), 200
     except:
         return jsonify({"app":"up","db":False}), 503
 
-# --- UPDATED: Full /chat route logic ---
-@app.route("/chat", methods=["POST"])
+@app.route("/chat", methods=["POST"] )
 def chat():
     try:
-        data = request.get_json()
-        if not data or "message" not in data:
-            return jsonify({"error": "Invalid input."}), 400
-
-        user_message = data["message"].strip()
-        history = data.get("history", [])
-        
-        conversation = (history + [{'role':'user','parts':[{'text':user_message}]}])[-4:]
-
-        job = q.enqueue(
-            call_generative_model,
-            args=[conversation], # Pass the full conversation context
-            retry=Retry(max=2),
-            result_ttl=600,
-            job_timeout=600
-        )
-
-        return jsonify({"job_id": job.get_id()})
+        data = request.get_json() or {}
+        msg = data.get('message','').strip()
+        hist = data.get('history', [])
+        if not msg:
+            return jsonify({"error":"No message provided."}), 400
+        conv = (hist + [{'role':'user','parts':[{'text':msg}]}])[-4:]
+        job = q.enqueue(call_generative_model, args=[conv], retry=Retry(max=2), job_timeout='5m', result_ttl=600)
+        return jsonify({'job_id': job.id})
     except Exception as e:
-        app.logger.error(f"/chat route error: {e}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
+        app.logger.error(f"/chat error: {e}", exc_info=True)
+        return jsonify({"error":"Internal server error"}), 500
 
-# --- NEW: /result/<job_id> route ---
-@app.route("/result/<job_id>")
+@app.route('/result/<job_id>')
 def get_job_result(job_id):
     try:
         job = Job.fetch(job_id, connection=redis_conn)
-        if job.is_finished:
-            return jsonify({"status": "finished", "result": job.result})
-        elif job.is_failed:
-            return jsonify({"status": "failed"})
-        else:
-            progress = job.meta.get("progress", "Processing...")
-            return jsonify({"status": "pending", "progress": progress})
+        if job.is_finished: return jsonify({'status':'finished','result':job.result})
+        if job.is_failed: return jsonify({'status':'failed'})
+        return jsonify({'status':'pending','progress': job.meta.get('progress','Processing...')})
     except Exception as e:
-        app.logger.error(f"Error fetching job result: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        app.logger.error(f"/result error: {e}", exc_info=True)
+        return jsonify({'status':'error','error':str(e)}), 500
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
-    # Your /summarize logic that enqueues a job goes here
-    pass
+    try:
+        data = request.get_json() or {}
+        url = data.get('url','').strip()
+        if not url:
+            return jsonify({"error":"No URL provided."}), 400
+        job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
+        return jsonify({'job_id': job.id})
+    except Exception as e:
+        app.logger.error(f"/summarize error: {e}", exc_info=True)
+        return jsonify({"error":"Internal server error"}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0",port=int(os.getenv('PORT',5000)))
