@@ -230,42 +230,48 @@ def call_summarize(url):
     if 'workdrive' in url:
         return {"status": "error", "message": "This is an internal document and cannot be summarized."}
 
-    allowed = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
-    if not allowed:
+    allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
+    if not allowed_domain:
         return {"status": "error", "message": "This document cannot be summarized."}
 
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
         resp.raise_for_status()
-        ct = resp.headers.get('Content-Type', '').lower()
-        text_content = ""
-        if 'application/pdf' in ct or url.lower().endswith('.pdf'):
+        content_type = resp.headers.get('Content-Type','').lower()
+        page_text = ""
+        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             with fitz.open(stream=resp.content, filetype="pdf") as pdf:
                 for page in pdf:
-                    text_content += page.get_text() + " "
+                    page_text += page.get_text() + " "
         else:
             soup = BeautifulSoup(resp.content, 'html.parser')
-            for tag in soup(['script','style','nav','footer','header']): tag.decompose()
-            text_content = soup.get_text(separator=' ', strip=True)
+            for tag in soup(['script','style','nav','footer','header']):
+                tag.decompose()
+            page_text = soup.get_text(separator=' ', strip=True)
 
-        if not text_content.strip():
+        if not page_text.strip():
             return {"status": "error", "message": "Could not extract meaningful text."}
 
         _update_job_progress("Summarizing content...")
-        prompt = f"Please provide a concise, 2-3 sentence summary of the following content:
+        
+        # UPDATED: Using triple quotes for the multi-line f-string
+        prompt = f"""Please provide a concise, 2-3 sentence summary of the following content:
 
-{text_content[:8000]}"
-        resp_ai = genai.GenerativeModel('gemini-1.5-flash').generate_content(
+{page_text[:8000]}"""
+        
+        # Note: Failover logic is not needed here as this is a separate AI call
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        resp_ai = model.generate_content(
             [{'role':'user','parts':[{'text':prompt}]}],
             generation_config=genai.types.GenerationConfig(temperature=0.4)
         )
-        summary = resp_ai.candidates[0].content.parts[0].text
-        return {"status": "success", "summary": summary}
+        
+        summary_text = resp_ai.candidates[0].content.parts[0].text
+        return {"status": "success", "summary": summary_text}
     except Exception as e:
         app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
         return {"status": "error", "message": "An error occurred during summarization."}
-
-
+        
 # --- Routes ---
 @app.route("/")
 def serve_frontend():
