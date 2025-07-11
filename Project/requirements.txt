@@ -1,11 +1,12 @@
 Flask
+Flask-Cors
 requests
 beautifulsoup4
 PyMuPDF
-google-generativeai
 gunicorn
 psycopg2-binary
 SQLAlchemy
 python-dotenv
 gevent
-Flask-Cors
+redis
+rq
