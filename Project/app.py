@@ -21,7 +21,8 @@ import fitz # PyMuPDF
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "https://clm-repo.onrender.com"}})
+# Remember to replace "*" with your frontend's exact origin for production
+CORS(app, resources={r"/*": {"origins": "*"}})
 logging.basicConfig(level=logging.INFO)
 
 # --- Redis Queue Setup ---
@@ -62,12 +63,27 @@ VALID_DOC_TYPES = [
     "Brochure or flyer", "Datasheet", "Presentation", "Technical Document", "Case study", "E-book or guide", "Solution brief", "Video", "Comparison document", "ROI calculator", "Other"
 ]
 
-search_tool = genai.protos.Tool(
-    function_declarations=[
-        genai.protos.FunctionDeclaration(name='search_database', description="Searches the database for documents.",
-            parameters=genai.protos.Schema(type=genai.protos.Type.OBJECT,properties={'product': genai.protos.Schema(type=genai.protos.Type.STRING),'document_type': genai.protos.Schema(type=genai.protos.Type.STRING),'keywords': genai.protos.Schema(type=genai.protos.Type.ARRAY, items=genai.protos.Schema(type=genai.protos.Type.STRING))}))
-    ]
-)
+# --- Tool Definition & System Prompt ---
+search_tool = {
+    "function_declarations": [{
+        "name": "search_database",
+        "description": "Searches the database for documents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "product": {"type": "string"},
+                "document_type": {"type": "string"},
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            # UPDATED: Fields are now optional for more flexibility
+            "required": []
+        }
+    }]
+}
+
 
 SYSTEM_PROMPT = f"""
 You are WSM Content Assistant, a function-calling AI that helps users find documents.
@@ -88,69 +104,159 @@ def _update_job_progress(message: str):
 
 @lru_cache(maxsize=128)
 def _cached_search(product, document_type, keyword_tuple):
-    return tuple(_search_database(product, document_type, list(keyword_tuple)))
+    results = _search_database(product, document_type, list(keyword_tuple))
+    # Safer handling of None results
+    return tuple(results) if results is not None else tuple()
 
 def search_database(product=None, document_type=None, keywords=None):
-    return list(_cached_search(product or "", document_type or "", tuple(keywords or [])))
+    key = (product or "", document_type or "", tuple(sorted(keywords or [])))
+    return list(_cached_search(*key))
 
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
-    # This is where your real database search logic goes.
-    # For now, it's a placeholder.
-    app.logger.info(f"WORKER DB SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
-    return [{"Product": product, "Doc_type": document_type, "Content_Title": "Real Document From DB", "Link": "#"}]
+    """Searches the database using vector similarity and smart filters."""
+    app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    
+    keywords = keywords or []
+    query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
+    if not query_text:
+        return []
+
+    try:
+        # Note: Different SDK versions might return resp.embedding instead
+        resp = genai.embed_content(
+            model="models/embedding-001",
+            content=query_text,
+            task_type="retrieval_query",
+            output_dimensionality=384
+        )
+        embedding = resp['embedding']
+    except Exception as e:
+        app.logger.error(f"Failed to embed search query: {e}")
+        return []
+
+    base_sql = """
+        SELECT "Product","Doc_type","Content_Title","Description","Link",
+               1 - (embedding <=> :emb) AS similarity
+         FROM content_repo
+        WHERE embedding IS NOT NULL
+    """
+    params = {"emb": json.dumps(embedding)}
+    filters = []
+    if product:
+        variants = [product] + PRODUCT_ACRONYM_MAP.get(product, [])
+        params["pv"] = [f"%{v}%" for v in variants]
+        filters.append('"Product" ILIKE ANY(:pv)')
+    if document_type:
+        params["dt"] = f"%{document_type}%"
+        filters.append('"Doc_type" ILIKE :dt')
+    if filters:
+        base_sql += " AND " + " AND ".join(filters)
+    base_sql += " ORDER BY similarity DESC LIMIT 10"
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(base_sql), params)
+            rows = result.fetchall()
+            app.logger.info(f"Found {len(rows)} results from database.")
+            return [dict(row._mapping) for row in rows]
+    except Exception as e:
+        # UPDATED: Return empty list on DB error to make the job more resilient
+        app.logger.error(f"Database vector search error: {e}", exc_info=True)
+        return []
 
 def call_generative_model(conversation_history):
-    """This function is executed by the background worker."""
-    app.logger.info("WORKER: Received job to process conversation.")
+    """This function is executed by the background worker for chat."""
+    app.logger.info("WORKER: Received chat job.")
     try:
-        _update_job_progress("Step 1/2: Analyzing request...")
+        _update_job_progress("Analyzing request...")
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT, tools=[search_tool])
         response = model.generate_content(conversation_history, generation_config=genai.types.GenerationConfig(temperature=0.1))
         part = response.candidates[0].content.parts[0]
 
         if getattr(part, "function_call", None):
-            _update_job_progress("Step 2/2: Searching database...")
+            _update_job_progress("Searching database...")
             docs = search_database(**part.function_call.args)
             if docs:
                 return {"type": "documents", "message": f"I found {len(docs)} document(s):", "data": docs}
-            return {"type": "conversation", "message": "I couldn't find any documents that match your request."}
+            # UPDATED: Clearer message for no results vs. an error
+            return {"type": "conversation", "message": "I searched but couldn't find any documents that match your request."}
         
         _update_job_progress("Formatting response...")
         return {"type": "conversation", "message": getattr(part, "text", "I’m not sure how to respond.")}
     except Exception as e:
-        app.logger.error(f"WORKER ERROR: {e}", exc_info=True)
-        raise
+        app.logger.error(f"WORKER ERROR in call_generative_model: {e}", exc_info=True)
+        return {"error": "An error occurred while analyzing your request."}
 
-# --- Routes (Now very fast) ---
-@app.route('/')
-def index():
-    return render_template('index.html')
+# --- UPDATED: Full implementation of the summarization worker function ---
+def call_summarize(url):
+    """This function is executed by the background worker for summarization."""
+    app.logger.info(f"WORKER: Starting summarization for {url}")
+    _update_job_progress("Fetching document content...")
 
-@app.route('/chat', methods=['POST'])
+    if 'workdrive' in url:
+        return {"status": "error", "message": "This is an internal document and cannot be summarized."}
+
+    allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
+    if not allowed_domain:
+        return {"status": "error", "message": "This document cannot be summarized."}
+
+    try:
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        resp.raise_for_status()
+        content_type = resp.headers.get('Content-Type','').lower()
+        page_text = ""
+        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+            with fitz.open(stream=resp.content, filetype="pdf") as pdf:
+                for page in pdf:
+                    page_text += page.get_text() + " "
+        else:
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            for tag in soup(['script','style','nav','footer','header']):
+                tag.decompose()
+            page_text = soup.get_text(separator=' ', strip=True)
+
+        if not page_text.strip():
+            return {"status": "error", "message": "Could not extract meaningful text."}
+
+        _update_job_progress("Summarizing content...")
+        prompt = f"Please provide a concise, 2-3 sentence summary of the following content:\n\n{page_text[:8000]}"
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        resp_ai = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(temperature=0.4))
+        
+        return {"status": "success", "summary": resp_ai.text}
+    except Exception as e:
+        app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
+        return {"status": "error", "message": "An error occurred during summarization."}
+
+
+# --- Routes ---
+@app.route("/")
+def serve_frontend():
+    return render_template("index.html")
+
+@app.route("/health")
+def health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return jsonify({"app":"up","db":True}), 200
+    except:
+        return jsonify({"app":"up","db":False}), 503
+
+@app.route("/chat", methods=["POST"])
 def chat():
-    """This route is now extremely fast. It just creates a job."""
     data = request.get_json() or {}
-    user_message = data.get("message", "").strip()
+    user_message = data.get("message","").strip()
     history = data.get("history", [])
     if not user_message:
-        return jsonify({"error": "No message provided."}), 400
+        return jsonify({"error":"No message provided."}), 400
 
-    conversation = (history + [{'role': 'user', 'parts': [{'text': user_message}]}])[-4:]
-    
-    job = q.enqueue(
-        call_generative_model,
-        args=[conversation],
-        retry=Retry(max=3),
-        job_timeout='5m',
-        result_ttl=600
-    )
-    
-    app.logger.info(f"Enqueued job {job.id} for user message: '{user_message}'")
+    conversation = (history + [{'role':'user','parts':[{'text':user_message}]}])[-4:]
+    job = q.enqueue(call_generative_model, args=[conversation], retry=Retry(max=3), job_timeout='5m', result_ttl=600)
     return jsonify({'job_id': job.id})
 
 @app.route('/result/<job_id>', methods=['GET'])
 def get_result(job_id):
-    """The frontend polls this endpoint to get the final result."""
     job = q.fetch_job(job_id)
     if job:
         if job.is_finished:
@@ -161,20 +267,17 @@ def get_result(job_id):
             return jsonify({'status': 'pending', 'progress': job.meta.get('progress', 'Processing...')})
     return jsonify({'status': 'not_found'}), 404
 
-# --- Other Routes ---
-@app.route("/health")
-def health_check():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return jsonify({"app":"up","db":True}), 200
-    except:
-        return jsonify({"app":"up","db":False}), 503
-
-# You would add your /summarize route logic here, also using the background worker pattern.
+# --- UPDATED: Summarize endpoint now correctly enqueues the job ---
 @app.route("/summarize", methods=["POST"])
 def summarize():
-    return jsonify({"status":"error", "message":"Summarize not implemented yet."})
+    data = request.get_json() or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error":"No URL provided."}), 400
 
-if __name__ == '__main__':
+    job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
+    app.logger.info(f"Enqueued summarization job {job.id} for URL: {url}")
+    return jsonify({'job_id': job.id})
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
