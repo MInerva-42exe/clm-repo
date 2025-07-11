@@ -21,7 +21,8 @@ import fitz # PyMuPDF
 # --- Setup ---
 load_dotenv()
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "https://clm-repo.onrender.com"}})
+# Remember to replace "*" with your frontend's exact origin for production
+CORS(app, resources={r"/*": {"origins": "*"}})
 logging.basicConfig(level=logging.INFO)
 
 # --- Redis Queue Setup ---
@@ -53,27 +54,6 @@ api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
 
-def generate_content_with_failover(*args, **kwargs):
-    for _ in range(len(GEMINI_API_KEYS)):
-        try:
-            model_kwargs = {
-                k: v for k, v in kwargs.items()
-                if k in ("tools", "system_instruction", "generation_config")
-            }
-            app.logger.debug(f"Calling Gemini with model_kwargs: {list(model_kwargs.keys())}")
-            
-            model = genai.GenerativeModel(
-                model_name="gemini-1.5-flash",
-                **model_kwargs
-            )
-            return model.generate_content(*args)
-        except (google.api_core.exceptions.PermissionDenied,
-                google.api_core.exceptions.ResourceExhausted) as e:
-            app.logger.warning(f"Key failed: {e}. Rotating key.")
-            genai.configure(api_key=next(api_key_cycler))
-    raise RuntimeError("All Gemini API keys failed.")
-
-
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"], "ADAudit Plus": ["ADAP"], "ADSelfService Plus": ["ADSSP"],
@@ -87,6 +67,24 @@ VALID_DOC_TYPES = [
     "Case study", "E-book or guide", "Solution brief", "Video",
     "Comparison document", "ROI calculator", "Other"
 ]
+
+# --- Normalization Helpers ---
+def normalize_product(product: str) -> str:
+    """Map any acronym or variant back to the canonical full product name."""
+    product = product.strip()
+    for full_name, acronyms in PRODUCT_ACRONYM_MAP.items():
+        if product.lower() == full_name.lower() or product in acronyms:
+            return full_name
+    return product
+
+
+def normalize_document_type(doc_type: str) -> str:
+    """Map incoming doc_type to one of the VALID_DOC_TYPES if it matches."""
+    doc_type = doc_type.strip().lower()
+    for valid in VALID_DOC_TYPES:
+        if doc_type == valid.lower() or doc_type in valid.lower():
+            return valid
+    return doc_type
 
 # --- Tool Definition & System Prompt ---
 search_tool = {
@@ -108,38 +106,16 @@ search_tool = {
     }]
 }
 
-
 SYSTEM_PROMPT = f"""
-You are WSM Content Assistant, a friendly, conversational AI expert on software documentation.
-Your sole job when users ask for documents is to call the `search_database` tool; otherwise, respond naturally or ask for clarification.
+You are WSM Content Assistant, a function-calling AI that helps users find documents.
+Your job is to analyze user queries and call the `search_database` tool with the appropriate parameters.
+If the user is making small talk, respond conversationally. If a query is too vague, ask for clarification.
 
-=== 1. INPUT PROCESSING ===
-1. PRODUCT NORMALIZATION (highest priority)
-   - Exact match input to full name or acronym in this map: {json.dumps(PRODUCT_ACRONYM_MAP)}
-   - Map acronyms (e.g. “ADMP”) → full name (“ADManager Plus”).
-2. DOCUMENT-TYPE MAPPING
-   - Restrict to one of: {json.dumps(VALID_DOC_TYPES)}.
-3. KEYWORD EXTRACTION
-   - Extract 2–5 core phrases; avoid stop-words (e.g. “please”, “docs”).
-
-If no documents match the query, do **not** invent titles—return an empty list or ask a follow-up question.
-
-=== 2. DECISION LOGIC ===
-- If the user clearly wants documents, immediately emit a function call in this exact JSON format:
-  {{
-    "name": "search_database",
-    "arguments": {{
-      "product": "...",
-      "document_type": "...",
-      "keywords": ["...", "..."]
-    }}
-  }}
-- If details are missing or ambiguous, ask a targeted follow-up (e.g., “Which product are you interested in?”).
-- Otherwise, continue the conversation in a polite, conversational tone.
+- Product Map: {json.dumps(PRODUCT_ACRONYM_MAP)}
+- Document Types: {json.dumps(VALID_DOC_TYPES)}
 """
 
 # --- Functions for the Worker ---
-
 def _update_job_progress(message: str):
     job = get_current_job()
     if job:
@@ -151,14 +127,22 @@ def _cached_search(product, document_type, keyword_tuple):
     results = _search_database(product, document_type, list(keyword_tuple))
     return tuple(results) if results is not None else tuple()
 
+
 def search_database(product=None, document_type=None, keywords=None):
-    key = (product or "", document_type or "", tuple(sorted(keywords or [])))
+    """Public-facing search function that normalizes inputs, then uses the cache."""
+    normalized_product = normalize_product(product or "")
+    normalized_doc_type = normalize_document_type(document_type or "")
+    key = (
+        normalized_product,
+        normalized_doc_type,
+        tuple(sorted(keywords or []))
+    )
     return list(_cached_search(*key))
+
 
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
     """Searches the database using vector similarity and smart filters."""
     app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
-    
     keywords = keywords or []
     query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
     if not query_text:
@@ -219,7 +203,7 @@ def call_generative_model(conversation_history):
             docs = search_database(**part.function_call.args)
             if docs:
                 return {"type": "documents", "message": f"I found {len(docs)} document(s):", "data": docs}
-            return {"type": "conversation", "message": "I searched but couldn't find any documents that match your request."}
+            return {"type": "conversation", "message": "I searched, but couldn't find any documents that match your request."}
         
         _update_job_progress("Formatting response...")
         return {"type": "conversation", "message": getattr(part, "text", "I’m not sure how to respond.")}
@@ -227,7 +211,6 @@ def call_generative_model(conversation_history):
         app.logger.error(f"WORKER ERROR in call_generative_model: {e}", exc_info=True)
         return {"error": "An error occurred while analyzing your request."}
 
-# --- UPDATED: Full implementation of the summarization worker function ---
 def call_summarize(url):
     """This function is executed by the background worker for summarization."""
     app.logger.info(f"WORKER: Starting summarization for {url}")
@@ -265,7 +248,6 @@ def call_summarize(url):
             system_instruction="You are a text summarizer.",
             generation_config=genai.types.GenerationConfig(temperature=0.4)
         )
-        
         summary_text = resp_ai.candidates[0].content.parts[0].text
         return {"status": "success", "summary": summary_text}
     except Exception as e:
@@ -318,13 +300,7 @@ def summarize():
     if not url:
         return jsonify({"error":"No URL provided."}), 400
 
-    job = q.enqueue(
-        call_summarize,
-        args=[url],
-        retry=Retry(max=1),
-        job_timeout='5m',
-        result_ttl=600
-    )
+    job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
     app.logger.info(f"Enqueued summarization job {job.id} for URL: {url}")
     return jsonify({'job_id': job.id})
 
