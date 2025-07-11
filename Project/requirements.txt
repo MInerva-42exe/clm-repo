@@ -10,3 +10,4 @@ python-dotenv
 gevent
 redis
 rq
+google-generativeai
