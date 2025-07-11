@@ -1,14 +1,15 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WSM Content Assistant</title>
+    <title>WSM Content Librarian</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 <body>
     <div class="chat-container">
         <header class="app-header">
-            <h1>WSM Content Assistant</h1>
+            <!-- UPDATED: Changed title -->
+            <h1>WSM Content Librarian</h1>
         </header>
         <main id="chat-window" class="chat-window">
             <div class="chat-message bot-message">
@@ -86,7 +87,8 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.job_id) {
-                        const loadingIndicator = appendMessage(`<div class="loading-state"><div class="spinner"></div><span>Submitting job...</span></div>`, 'bot');
+                        // UPDATED: Changed loading text
+                        const loadingIndicator = appendMessage(`<div class="loading-state"><div class="spinner"></div><span>Processing question...</span></div>`, 'bot');
                         pollForResult(data.job_id, loadingIndicator);
                     } else { throw new Error('Failed to create chat job.'); }
                 })
@@ -137,7 +139,6 @@
                 }, 2500);
             }
             
-            // --- UPDATED: getSummary function now uses the polling logic ---
             window.getSummary = function(button, contextId) {
                 const url = button.dataset.url;
                 const contextWrapper = document.getElementById(contextId);
