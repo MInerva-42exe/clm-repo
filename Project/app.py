@@ -1,7 +1,7 @@
 import os
 import json
-import logging
 from itertools import cycle
+import logging
 from functools import lru_cache
 
 from flask import Flask, render_template, request, jsonify
@@ -13,26 +13,23 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 import requests
 from bs4 import BeautifulSoup
-import fitz  # PyMuPDF
+import fitz # PyMuPDF
 
 # --- Setup ---
 load_dotenv()
-app = Flask(
-    __name__,
-    static_folder="static",       # serve style.css (and other assets)
-    template_folder="templates"   # render index.html
-)
+app = Flask(__name__)
 CORS(app, resources={
-    r"/chat":       {"origins": "https://clm-repo.onrender.com"},
-    r"/summarize":  {"origins": "https://clm-repo.onrender.com"},
-    r"/health":     {"origins": "https://clm-repo.onrender.com"}
+    r"/chat": {"origins": "https://clm-repo.onrender.com"},
+    r"/summarize": {"origins": "https://clm-repo.onrender.com"},
+    r"/health": {"origins": "https://clm-repo.onrender.com"}
 })
 logging.basicConfig(level=logging.INFO)
 
+
 # --- Database & AI Key Setup ---
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get('DATABASE_URL')
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL must be set in environment")
+    raise ValueError("DATABASE_URL is not set in .env file.")
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 try:
@@ -43,20 +40,26 @@ except OperationalError as e:
     app.logger.error(f"❌ Database connection failed on startup: {e}", exc_info=True)
     raise
 
+
 GEMINI_API_KEYS_STR = os.environ.get("GEMINI_API_KEYS")
 if not GEMINI_API_KEYS_STR:
-    raise RuntimeError("GEMINI_API_KEYS must be set in environment")
-GEMINI_API_KEYS = [k.strip() for k in GEMINI_API_KEYS_STR.split(",") if k.strip()]
+    raise ValueError("GEMINI_API_KEYS is not set in .env file.")
+GEMINI_API_KEYS = [k.strip() for k in GEMINI_API_KEYS_STR.split(',') if k.strip()]
 if not GEMINI_API_KEYS:
-    raise RuntimeError("No valid Gemini API keys found.")
+    raise ValueError("No valid Gemini API keys found.")
 api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
+
 def generate_content_with_failover(*args, **kwargs):
-    for _ in GEMINI_API_KEYS:
+    for _ in range(len(GEMINI_API_KEYS)):
         try:
-            model_kwargs = {k: v for k, v in kwargs.items()
-                            if k in ("tools", "system_instruction", "generation_config")}
+            model_kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in ("tools", "system_instruction", "generation_config")
+            }
+            app.logger.debug(f"Calling Gemini with model_kwargs: {list(model_kwargs.keys())}")
+            
             model = genai.GenerativeModel(
                 model_name="gemini-1.5-flash",
                 **model_kwargs
@@ -64,9 +67,10 @@ def generate_content_with_failover(*args, **kwargs):
             return model.generate_content(*args)
         except (google.api_core.exceptions.PermissionDenied,
                 google.api_core.exceptions.ResourceExhausted) as e:
-            app.logger.warning(f"Gemini key failed: {e}. Rotating key.")
+            app.logger.warning(f"Key failed: {e}. Rotating key.")
             genai.configure(api_key=next(api_key_cycler))
     raise RuntimeError("All Gemini API keys failed.")
+
 
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
@@ -80,6 +84,7 @@ VALID_DOC_TYPES = [
     "Case study", "E-book or guide", "Solution brief", "Video",
     "Comparison document", "ROI calculator", "Other"
 ]
+
 
 # --- Tool Definition & System Prompt ---
 search_tool = genai.protos.Tool(
@@ -104,24 +109,45 @@ search_tool = genai.protos.Tool(
 
 SYSTEM_PROMPT = f"""
 You are WSM Content Assistant, a friendly, conversational AI expert on software documentation.
-Your sole job when users ask for documents is to call the `search_database` tool; otherwise, respond naturally.
+Your sole job when users ask for documents is to call the `search_database` tool; otherwise, respond naturally or ask for clarification.
 
-Product map: {json.dumps(PRODUCT_ACRONYM_MAP)}
-Doc types: {json.dumps(VALID_DOC_TYPES)}
+=== 1. INPUT PROCESSING ===
+1. PRODUCT NORMALIZATION (highest priority)
+   - Map any product name or acronym to its canonical form using:
+     {json.dumps(PRODUCT_ACRONYM_MAP)}
+2. DOCUMENT-TYPE MAPPING
+   - Map user requests to one of:
+     {json.dumps(VALID_DOC_TYPES)}
+3. KEYWORD EXTRACTION
+   - Pull out 2–5 core phrases that capture user intent.
+     E.g. “Active Directory user provisioning” → ["active directory", "user provisioning"]
+
+=== 2. DECISION LOGIC ===
+- **If the user is clearly asking for documents**, immediately call the `search_database` tool.
+- **If details are missing or ambiguous**, ask a follow-up question.
+- **Otherwise**, carry on the conversation as normal.
 """
 
-# --- Semantic Search ---
+
+# --- Semantic Search Implementation ---
 @lru_cache(maxsize=128)
 def _cached_search(product, document_type, keyword_tuple):
+    """Internal cached search function."""
     return tuple(_search_database(product, document_type, list(keyword_tuple)))
 
 def search_database(product=None, document_type=None, keywords=None):
+    """Public-facing search function that uses the cache."""
     return list(_cached_search(product or "", document_type or "", tuple(keywords or [])))
 
+# --- UPDATED: Restored the full database search logic ---
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
+    """Searches the database using vector similarity and smart filters."""
+    app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    
     keywords = keywords or []
     query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
     if not query_text:
+        app.logger.info("No query text provided for embedding. Returning empty.")
         return []
 
     try:
@@ -138,8 +164,8 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
     base_sql = """
         SELECT "Product","Doc_type","Content_Title","Description","Link",
                1 - (embedding <=> :emb) AS similarity
-          FROM content_repo
-         WHERE embedding IS NOT NULL
+         FROM content_repo
+        WHERE embedding IS NOT NULL
     """
     params = {"emb": json.dumps(embedding)}
     filters = []
@@ -157,13 +183,16 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
     try:
         with engine.connect() as conn:
             result = conn.execute(text(base_sql), params)
-            return [dict(row._mapping) for row in result.fetchall()]
+            rows = result.fetchall()
+            app.logger.info(f"Found {len(rows)} results from database.")
+            return [dict(row._mapping) for row in rows]
     except Exception as e:
         app.logger.error(f"Database vector search error: {e}", exc_info=True)
-        return []
+        raise
 
 # --- Document Summarization ---
 def fetch_and_summarize_document(url):
+    """Fetches content from a URL and summarizes it based on specific rules."""
     app.logger.info(f"Attempting to summarize URL: {url}")
     if 'workdrive' in url:
         return "This is an internal document and cannot be summarized."
@@ -176,21 +205,21 @@ def fetch_and_summarize_document(url):
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
         resp.raise_for_status()
         content_type = resp.headers.get('Content-Type','').lower()
-        text = ""
+        page_text = ""
         if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
             with fitz.open(stream=resp.content, filetype="pdf") as pdf:
                 for page in pdf:
-                    text += page.get_text() + " "
+                    page_text += page.get_text() + " "
         else:
             soup = BeautifulSoup(resp.content, 'html.parser')
             for tag in soup(['script','style','nav','footer','header']):
                 tag.decompose()
-            text = soup.get_text(separator=' ', strip=True)
+            page_text = soup.get_text(separator=' ', strip=True)
 
-        if not text.strip():
+        if not page_text.strip():
             return "Could not extract meaningful text from the document."
 
-        prompt = f"Please provide a concise, 2-3 sentence summary of the following content:\n\n{text[:8000]}"
+        prompt = f"Please provide a concise, 2-3 sentence summary of the following content:\n\n{page_text[:8000]}"
         resp_ai = generate_content_with_failover(
             [{'role':'user','parts':[{'text':prompt}]}],
             system_instruction="You are a text summarizer.",
@@ -255,5 +284,4 @@ def summarize():
     return jsonify({"status":"success","summary":summary})
 
 if __name__ == "__main__":
-    # bind to all interfaces and honor Render's PORT
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
