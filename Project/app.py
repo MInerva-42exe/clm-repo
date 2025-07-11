@@ -22,7 +22,7 @@ import fitz # PyMuPDF
 load_dotenv()
 app = Flask(__name__)
 # Remember to replace "*" with your frontend's exact origin for production
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "https://clm-repo.onrender.com"}})
 logging.basicConfig(level=logging.INFO)
 
 # --- Redis Queue Setup ---
@@ -200,11 +200,13 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
         return []
 
     try:
-        # UPDATED: Removed the incorrect output_dimensionality parameter
+        # --- THIS IS THE CORRECTED CODE ---
+        # Re-instating the output_dimensionality to match your 384-dimension database
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
-            task_type="retrieval_query"
+            task_type="retrieval_query",
+            output_dimensionality=384
         )
         embedding = resp['embedding']
     except Exception as e:
