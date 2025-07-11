@@ -3,8 +3,8 @@ from redis import Redis
 from rq import Worker, Queue
 from dotenv import load_dotenv
 
-# Import the function that does the slow work from your main app
-from app import call_generative_model
+# Import BOTH functions the worker will need to run
+from app import call_generative_model, call_summarize
 
 load_dotenv()
 
