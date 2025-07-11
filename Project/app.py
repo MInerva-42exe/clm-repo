@@ -190,16 +190,17 @@ def search_database(product=None, document_type=None, keywords=None):
     )
     return list(_cached_search(*key))
 
-
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
     """Searches the database using vector similarity and smart filters."""
     app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
+    
     keywords = keywords or []
     query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
     if not query_text:
         return []
 
     try:
+        # UPDATED: Removed the incorrect output_dimensionality parameter
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
