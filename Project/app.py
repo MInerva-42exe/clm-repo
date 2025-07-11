@@ -247,8 +247,15 @@ def call_generative_model(conversation_history):
     app.logger.info("WORKER: Received chat job.")
     try:
         _update_job_progress("Analyzing request...")
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT, tools=[search_tool])
-        response = model.generate_content(conversation_history, generation_config=genai.types.GenerationConfig(temperature=0.1))
+        
+        # --- UPDATED: Using the failover wrapper ---
+        response = generate_content_with_failover(
+            conversation_history,
+            tools=[search_tool],
+            system_instruction=SYSTEM_PROMPT,
+            generation_config=genai.types.GenerationConfig(temperature=0.1)
+        )
+        
         part = response.candidates[0].content.parts[0]
 
         if getattr(part, "function_call", None):
@@ -272,44 +279,44 @@ def call_summarize(url):
     if 'workdrive' in url:
         return {"status": "error", "message": "This is an internal document and cannot be summarized."}
 
-    allowed_domain = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
-    if not allowed_domain:
+    allowed = 'download.manageengine.com' in url or 'manageengine.com' in url or url.lower().endswith('.pdf')
+    if not allowed:
         return {"status": "error", "message": "This document cannot be summarized."}
 
     try:
         resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
         resp.raise_for_status()
-        content_type = resp.headers.get('Content-Type','').lower()
-        page_text = ""
-        if 'application/pdf' in content_type or url.lower().endswith('.pdf'):
+        ct = resp.headers.get('Content-Type', '').lower()
+        text_content = ""
+        if 'application/pdf' in ct or url.lower().endswith('.pdf'):
             with fitz.open(stream=resp.content, filetype="pdf") as pdf:
                 for page in pdf:
-                    page_text += page.get_text() + " "
+                    text_content += page.get_text() + " "
         else:
             soup = BeautifulSoup(resp.content, 'html.parser')
-            for tag in soup(['script','style','nav','footer','header']):
-                tag.decompose()
-            page_text = soup.get_text(separator=' ', strip=True)
+            for tag in soup(['script','style','nav','footer','header']): tag.decompose()
+            text_content = soup.get_text(separator=' ', strip=True)
 
-        if not page_text.strip():
+        if not text_content.strip():
             return {"status": "error", "message": "Could not extract meaningful text."}
 
         _update_job_progress("Summarizing content...")
         prompt = f"""Please provide a concise, 2-3 sentence summary of the following content:
 
-{page_text[:8000]}"""
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        resp_ai = model.generate_content(
+{text_content[:8000]}"""
+        
+        # --- UPDATED: Using the failover wrapper ---
+        resp_ai = generate_content_with_failover(
             [{'role':'user','parts':[{'text':prompt}]}],
+            system_instruction="You are a text summarizer.",
             generation_config=genai.types.GenerationConfig(temperature=0.4)
         )
         
-        summary_text = resp_ai.candidates[0].content.parts[0].text
-        return {"status": "success", "summary": summary_text}
+        summary = resp_ai.candidates[0].content.parts[0].text
+        return {"status": "success", "summary": summary}
     except Exception as e:
         app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
         return {"status": "error", "message": "An error occurred during summarization."}
-
 
 # --- Routes ---
 @app.route("/")
