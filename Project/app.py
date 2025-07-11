@@ -12,11 +12,11 @@ import google.api_core.exceptions
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from redis import Redis
-from rq import Queue, get_current_job
-from rq.job import Retry
+# --- UPDATED: Added 'Job' to the import line ---
+from rq import Queue, get_current_job, Retry, Job
 import requests
 from bs4 import BeautifulSoup
-import fitz  # PyMuPDF
+import fitz # PyMuPDF
 
 # --- Setup ---
 load_dotenv()
@@ -52,6 +52,7 @@ if not GEMINI_API_KEYS_STR:
 GEMINI_API_KEYS = [k.strip() for k in GEMINI_API_KEYS_STR.split(',') if k.strip()]
 api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
+
 
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
@@ -140,72 +141,60 @@ def search_database(product=None, document_type=None, keywords=None):
 
 
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
-    """Searches the database using vector similarity on title, description, and metadata filters."""
+    """Searches the database using vector similarity and smart filters."""
     app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
     keywords = keywords or []
     query_text = " ".join(keywords).strip() or f"{product} {document_type}".strip()
     if not query_text:
         return []
 
-    # 1. Generate embedding via Gemini
     try:
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
-            task_type="retrieval_query",
-            output_dimensionality=384
+            task_type="retrieval_query"
         )
         embedding = resp['embedding']
     except Exception as e:
         app.logger.error(f"Failed to embed search query: {e}")
         return []
 
-    # 2. Perform semantic search in Postgres
-    sql = text(
-        """
-        SELECT "Content_Title","Description","Product","Doc_type","Link"
-        FROM content_repo
+    base_sql = """
+        SELECT "Product","Doc_type","Content_Title","Description","Link",
+               1 - (embedding <=> :emb) AS similarity
+         FROM content_repo
         WHERE embedding IS NOT NULL
-          AND (:product = '' OR "Product" ILIKE :prod)
-          AND (:doc_type = '' OR "Doc_type" ILIKE :dtype)
-        ORDER BY embedding <=> :emb
-        LIMIT 10
-        """
-    )
-    params = {
-        'emb': json.dumps(embedding),
-        'product': product,
-        'prod': f"%{product}%",
-        'doc_type': document_type,
-        'dtype': f"%{document_type}%"
-    }
+    """
+    params = {"emb": json.dumps(embedding)}
+    filters = []
+    if product:
+        variants = [product] + PRODUCT_ACRONYM_MAP.get(product, [])
+        params["pv"] = [f"%{v}%" for v in variants]
+        filters.append('"Product" ILIKE ANY(:pv)')
+    if document_type:
+        params["dt"] = f"%{document_type}%"
+        filters.append('"Doc_type" ILIKE :dt')
+    if filters:
+        base_sql += " AND " + " AND ".join(filters)
+    base_sql += " ORDER BY similarity DESC LIMIT 10"
 
     try:
         with engine.connect() as conn:
-            result = conn.execute(sql, params)
+            result = conn.execute(text(base_sql), params)
             rows = result.fetchall()
             app.logger.info(f"Found {len(rows)} results from database.")
             return [dict(row._mapping) for row in rows]
     except Exception as e:
-        app.logger.error(f"Database semantic search error: {e}", exc_info=True)
+        app.logger.error(f"Database vector search error: {e}", exc_info=True)
         return []
-
-
 
 def call_generative_model(conversation_history):
     """This function is executed by the background worker for chat."""
     app.logger.info("WORKER: Received chat job.")
     try:
         _update_job_progress("Analyzing request...")
-        model = genai.GenerativeModel(
-            'gemini-1.5-flash',
-            system_instruction=SYSTEM_PROMPT,
-            tools=[search_tool]
-        )
-        response = model.generate_content(
-            conversation_history,
-            generation_config=genai.types.GenerationConfig(temperature=0.1)
-        )
+        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=SYSTEM_PROMPT, tools=[search_tool])
+        response = model.generate_content(conversation_history, generation_config=genai.types.GenerationConfig(temperature=0.1))
         part = response.candidates[0].content.parts[0]
 
         if getattr(part, "function_call", None):
@@ -214,13 +203,12 @@ def call_generative_model(conversation_history):
             if docs:
                 return {"type": "documents", "message": f"I found {len(docs)} document(s):", "data": docs}
             return {"type": "conversation", "message": "I searched, but couldn't find any documents that match your request."}
-
+        
         _update_job_progress("Formatting response...")
         return {"type": "conversation", "message": getattr(part, "text", "I’m not sure how to respond.")}
     except Exception as e:
         app.logger.error(f"WORKER ERROR in call_generative_model: {e}", exc_info=True)
         return {"error": "An error occurred while analyzing your request."}
-
 
 def call_summarize(url):
     """This function is executed by the background worker for summarization."""
@@ -253,13 +241,9 @@ def call_summarize(url):
             return {"status": "error", "message": "Could not extract meaningful text."}
 
         _update_job_progress("Summarizing content...")
-        
-        # UPDATED: Using triple quotes for the multi-line f-string
         prompt = f"""Please provide a concise, 2-3 sentence summary of the following content:
 
 {page_text[:8000]}"""
-        
-        # Note: Failover logic is not needed here as this is a separate AI call
         model = genai.GenerativeModel('gemini-1.5-flash')
         resp_ai = model.generate_content(
             [{'role':'user','parts':[{'text':prompt}]}],
@@ -271,7 +255,8 @@ def call_summarize(url):
     except Exception as e:
         app.logger.error(f"Error during summarization worker: {e}", exc_info=True)
         return {"status": "error", "message": "An error occurred during summarization."}
-        
+
+
 # --- Routes ---
 @app.route("/")
 def serve_frontend():
@@ -280,49 +265,48 @@ def serve_frontend():
 @app.route("/health")
 def health_check():
     try:
-        with engine.connect() as conn: conn.execute(text("SELECT 1"))
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return jsonify({"app":"up","db":True}), 200
     except:
         return jsonify({"app":"up","db":False}), 503
 
-@app.route("/chat", methods=["POST"] )
+@app.route("/chat", methods=["POST"])
 def chat():
-    try:
-        data = request.get_json() or {}
-        msg = data.get('message','').strip()
-        hist = data.get('history', [])
-        if not msg:
-            return jsonify({"error":"No message provided."}), 400
-        conv = (hist + [{'role':'user','parts':[{'text':msg}]}])[-4:]
-        job = q.enqueue(call_generative_model, args=[conv], retry=Retry(max=2), job_timeout='5m', result_ttl=600)
-        return jsonify({'job_id': job.id})
-    except Exception as e:
-        app.logger.error(f"/chat error: {e}", exc_info=True)
-        return jsonify({"error":"Internal server error"}), 500
+    data = request.get_json() or {}
+    user_message = data.get("message","").strip()
+    history = data.get("history", [])
+    if not user_message:
+        return jsonify({"error":"No message provided."}), 400
+
+    conversation = (history + [{'role':'user','parts':[{'text':user_message}]}])[-4:]
+    job = q.enqueue(call_generative_model, args=[conversation], retry=Retry(max=3), job_timeout='5m', result_ttl=600)
+    return jsonify({'job_id': job.id})
 
 @app.route('/result/<job_id>')
 def get_job_result(job_id):
     try:
         job = Job.fetch(job_id, connection=redis_conn)
-        if job.is_finished: return jsonify({'status':'finished','result':job.result})
-        if job.is_failed: return jsonify({'status':'failed'})
-        return jsonify({'status':'pending','progress': job.meta.get('progress','Processing...')})
+        if job.is_finished:
+            return jsonify({'status':'finished','result':job.result})
+        elif job.is_failed:
+            return jsonify({'status':'failed'})
+        else:
+            return jsonify({'status':'pending','progress': job.meta.get('progress','Processing...')})
     except Exception as e:
         app.logger.error(f"/result error: {e}", exc_info=True)
         return jsonify({'status':'error','error':str(e)}), 500
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
-    try:
-        data = request.get_json() or {}
-        url = data.get('url','').strip()
-        if not url:
-            return jsonify({"error":"No URL provided."}), 400
-        job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
-        return jsonify({'job_id': job.id})
-    except Exception as e:
-        app.logger.error(f"/summarize error: {e}", exc_info=True)
-        return jsonify({"error":"Internal server error"}), 500
+    data = request.get_json() or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error":"No URL provided."}), 400
+
+    job = q.enqueue(call_summarize, args=[url], retry=Retry(max=1), job_timeout='5m', result_ttl=600)
+    app.logger.info(f"Enqueued summarization job {job.id} for URL: {url}")
+    return jsonify({'job_id': job.id})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0",port=int(os.getenv('PORT',5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
