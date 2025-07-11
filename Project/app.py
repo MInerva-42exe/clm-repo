@@ -12,8 +12,8 @@ import google.api_core.exceptions
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from redis import Redis
-# --- UPDATED: Added 'Job' to the import line ---
-from rq import Queue, get_current_job, Retry, Job
+from rq import Queue, get_current_job, Retry
+from rq.job import Job # Corrected Import
 import requests
 from bs4 import BeautifulSoup
 import fitz # PyMuPDF
@@ -152,7 +152,8 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
-            task_type="retrieval_query"
+            task_type="retrieval_query",
+            output_dimensionality=384
         )
         embedding = resp['embedding']
     except Exception as e:
