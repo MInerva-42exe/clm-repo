@@ -59,10 +59,15 @@
             function createDocumentCard(doc) {
                 const docTypeHTML = doc.Doc_type ? `<span class="tag tag-blue">${doc.Doc_type}</span>` : '';
                 const productHTML = doc.Product ? `<span class="tag tag-gray">${doc.Product}</span>` : '';
+                const contextId = `context-${Date.now()}-${Math.random()}`;
                 return `<div class="doc-card">
                             <div class="card-header"><h3>${doc.Content_Title || 'Untitled'}</h3><div class="tags">${productHTML}${docTypeHTML}</div></div>
                             <div class="card-body"><p>${doc.Description || 'No description.'}</p></div>
-                            <div class="card-footer"><a href="${doc.Link}" target="_blank" class="button-secondary">View</a><button class="button-primary">Summarize</button></div>
+                            <div class="card-footer">
+                                <a href="${doc.Link}" target="_blank" class="button-secondary">View Document</a>
+                                <button class="button-primary summarize-btn" data-url="${doc.Link}" onclick="getSummary(this, '${contextId}')">Summarize</button>
+                            </div>
+                            <div class="context-wrapper" id="${contextId}"></div>
                         </div>`;
             }
 
@@ -83,7 +88,7 @@
                     if (data.job_id) {
                         const loadingIndicator = appendMessage(`<div class="loading-state"><div class="spinner"></div><span>Submitting job...</span></div>`, 'bot');
                         pollForResult(data.job_id, loadingIndicator);
-                    } else { throw new Error('Failed to create job.'); }
+                    } else { throw new Error('Failed to create chat job.'); }
                 })
                 .catch(error => {
                     console.error('Error:', error);
@@ -120,7 +125,7 @@
                                 chatWindow.removeChild(loadingElement);
                                 appendMessage(`<p class="error">The request failed to process.</p>`, 'bot');
                             } else if (data.status === 'pending' && data.progress) {
-                                loadingStateDiv.textContent = data.progress;
+                                if(loadingStateDiv) loadingStateDiv.textContent = data.progress;
                             }
                         })
                         .catch(error => {
@@ -128,6 +133,80 @@
                             chatWindow.removeChild(loadingElement);
                             console.error('Error polling:', error);
                             appendMessage(`<p class="error">Error checking status.</p>`, 'bot');
+                        });
+                }, 2500);
+            }
+            
+            // --- UPDATED: getSummary function now uses the polling logic ---
+            window.getSummary = function(button, contextId) {
+                const url = button.dataset.url;
+                const contextWrapper = document.getElementById(contextId);
+                button.disabled = true;
+                button.textContent = 'Summarizing...';
+                
+                const loadingIndicator = document.createElement('div');
+                loadingIndicator.classList.add('loading-state');
+                loadingIndicator.style.padding = '1rem 0';
+                loadingIndicator.innerHTML = `<div class="spinner"></div><span>Submitting summary job...</span>`;
+                contextWrapper.innerHTML = '';
+                contextWrapper.appendChild(loadingIndicator);
+
+                fetch('/summarize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: url })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.job_id) {
+                        pollForSummary(data.job_id, contextWrapper, button);
+                    } else {
+                        throw new Error('Failed to create summary job.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    contextWrapper.innerHTML = `<div class="context-container error">Failed to start summary job.</div>`;
+                    button.disabled = false;
+                    button.textContent = 'Summarize';
+                });
+            }
+
+            function pollForSummary(jobId, contextWrapper, button) {
+                const loadingStateSpan = contextWrapper.querySelector('.loading-state span');
+
+                const interval = setInterval(() => {
+                    fetch(`/result/${jobId}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.status === 'finished') {
+                                clearInterval(interval);
+                                const result = data.result;
+                                if (result.status === 'success') {
+                                    const summaryHTML = `<div class="context-container"><strong>Summary:</strong> ${result.summary.replace(/\n/g, '<br>')}</div>`;
+                                    contextWrapper.innerHTML = summaryHTML;
+                                    button.style.display = 'none';
+                                } else {
+                                    const errorHTML = `<div class="context-container error">${result.message}</div>`;
+                                    contextWrapper.innerHTML = errorHTML;
+                                    button.disabled = false;
+                                    button.textContent = 'Summarize';
+                                }
+                            } else if (data.status === 'failed') {
+                                clearInterval(interval);
+                                contextWrapper.innerHTML = `<div class="context-container error">The summary job failed.</div>`;
+                                button.disabled = false;
+                                button.textContent = 'Summarize';
+                            } else if (data.status === 'pending' && data.progress) {
+                                if(loadingStateSpan) loadingStateSpan.textContent = data.progress;
+                            }
+                        })
+                        .catch(error => {
+                            clearInterval(interval);
+                            console.error('Error polling summary:', error);
+                            contextWrapper.innerHTML = `<div class="context-container error">Error checking summary status.</div>`;
+                            button.disabled = false;
+                            button.textContent = 'Summarize';
                         });
                 }, 2500);
             }
