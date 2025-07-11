@@ -77,7 +77,8 @@ PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"], "ADAudit Plus": ["ADAP"], "ADSelfService Plus": ["ADSSP"],
     "Recovery Manager Plus": ["RMP"], "Exchange Reporter Plus": ["ERP"], "M365 Manager Plus": ["MMP", "M365MP"],
     "SharePoint Manager Plus": ["SPMP"], "DataSecurity Plus": ["DSP"], "Identity360": ["ID360"],
-    "AD360": [], "Log360": []
+    "AD360": ["AD360", "AD 360", "ManageEngine AD360"],
+    "Log360": ["Log360", "Log 360", "ManageEngine Log360"]
 }
 VALID_DOC_TYPES = [
     "Brochure or flyer", "Datasheet", "Presentation", "Technical Document",
@@ -113,8 +114,9 @@ Your sole job when users ask for documents is to call the `search_database` tool
 
 === 1. INPUT PROCESSING ===
 1. PRODUCT NORMALIZATION (highest priority)
-   - Map any product name or acronym to its canonical form using:
-     {json.dumps(PRODUCT_ACRONYM_MAP)}
+   - First, check if the user's input exactly matches a key or a value (acronym) in this map: {json.dumps(PRODUCT_ACRONYM_MAP)}.
+   - If it's an acronym (like "ADMP"), map it to the full name ("ADManager Plus").
+   - If it's already a full name (like "AD360"), use it directly.
 2. DOCUMENT-TYPE MAPPING
    - Map user requests to one of:
      {json.dumps(VALID_DOC_TYPES)}
@@ -139,7 +141,6 @@ def search_database(product=None, document_type=None, keywords=None):
     """Public-facing search function that uses the cache."""
     return list(_cached_search(product or "", document_type or "", tuple(keywords or [])))
 
-# --- UPDATED: Restored the full database search logic ---
 def _search_database(product: str = "", document_type: str = "", keywords: list = None):
     """Searches the database using vector similarity and smart filters."""
     app.logger.info(f"DATABASE SEARCH: Product='{product}', Type='{document_type}', Keywords={keywords}")
@@ -192,7 +193,6 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
 
 # --- Document Summarization ---
 def fetch_and_summarize_document(url):
-    """Fetches content from a URL and summarizes it based on specific rules."""
     app.logger.info(f"Attempting to summarize URL: {url}")
     if 'workdrive' in url:
         return "This is an internal document and cannot be summarized."
