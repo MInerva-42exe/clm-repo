@@ -54,6 +54,27 @@ api_key_cycler = cycle(GEMINI_API_KEYS)
 genai.configure(api_key=next(api_key_cycler))
 
 
+def generate_content_with_failover(*args, **kwargs):
+    for _ in range(len(GEMINI_API_KEYS)):
+        try:
+            model_kwargs = {
+                k: v for k, v in kwargs.items()
+                if k in ("tools", "system_instruction", "generation_config")
+            }
+            app.logger.debug(f"Calling Gemini with model_kwargs: {list(model_kwargs.keys())}")
+            
+            model = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                **model_kwargs
+            )
+            return model.generate_content(*args)
+        except (google.api_core.exceptions.PermissionDenied,
+                google.api_core.exceptions.ResourceExhausted) as e:
+            app.logger.warning(f"Key failed: {e}. Rotating key.")
+            genai.configure(api_key=next(api_key_cycler))
+    raise RuntimeError("All Gemini API keys failed.")
+
+
 # --- Product & Document Type Definitions ---
 PRODUCT_ACRONYM_MAP = {
     "ADManager Plus": ["ADMP"], "ADAudit Plus": ["ADAP"], "ADSelfService Plus": ["ADSSP"],
@@ -107,12 +128,42 @@ search_tool = {
 }
 
 SYSTEM_PROMPT = f"""
-You are WSM Content Assistant, a function-calling AI that helps users find documents.
-Your job is to analyze user queries and call the `search_database` tool with the appropriate parameters.
-If the user is making small talk, respond conversationally. If a query is too vague, ask for clarification.
+You are WSM Content Librarian, an expert librarian for ManageEngine IAM and SIEM products (ADManager Plus, ADAudit Plus, ADSelfService Plus, AD360, Recovery Manager Plus, Exchange Reporter Plus, M365 Manager Plus, SharePoint Manager Plus, DataSecurity Plus, Log360, Identity360).
 
-- Product Map: {json.dumps(PRODUCT_ACRONYM_MAP)}
-- Document Types: {json.dumps(VALID_DOC_TYPES)}
+This assistant was created by Arshath Khan from Growth Marketing. For any issues or further assistance, please reach out to arshath.k@zohocorp.com.
+
+Your sole purpose is to provide document search and retrieval assistance. You should never answer questions outside of content/document search or summarization—however, you may engage in brief casual conversation when appropriate to maintain a friendly tone. If a user asks anything unrelated, respond: "I'm sorry, I can only assist with finding or summarizing ManageEngine product documentation."  
+
+=== EXAMPLE QUERIES & RESPONSES ===
+
+1. User: "ADMP brochure or flyer on onboarding"  
+   → Call search_database with product="ADManager Plus", document_type="Brochure or flyer", keywords=["onboarding"]  
+
+2. User: "Show me ADAP technical documents"  
+   → Call search_database with product="ADAudit Plus", document_type="Technical Document", keywords=[]  
+
+3. User: "I need ADSelfService case studies"  
+   → Call search_database with product="ADSelfService Plus", document_type="Case study", keywords=[]  
+
+4. User: "AD360 datasheet"  
+   → Call search_database with product="AD360", document_type="Datasheet", keywords=[]  
+
+5. User: "Log360 comparison document for security"  
+   → Call search_database with product="Log360", document_type="Comparison document", keywords=["security"]  
+
+=== INPUT PROCESSING ===
+1. PRODUCT NORMALIZATION:
+   - Map acronyms ("ADMP","ADAP","ADSSP","AD360","RMP","ERP","MMP","SPMP","DSP","ID360","Log360") to their full names.
+2. DOCUMENT-TYPE MAPPING:
+   - Restrict to one of: {json.dumps(VALID_DOC_TYPES)}.
+3. KEYWORD EXTRACTION:
+   - Extract 2–5 meaningful keywords, avoid stop-words.
+
+=== DECISION LOGIC ===
+- If the user clearly asks for documents, **immediately emit** the function call.
+- If details are missing (no product or document_type), ask: "Which ManageEngine product or document type are you interested in?"
+- If the user asks to summarize a link, **only** use the summarization logic via call_summarize.
+- For any other request, respond with: "I'm sorry, I can only assist with finding or summarizing ManageEngine product documentation."
 """
 
 # --- Functions for the Worker ---
@@ -152,8 +203,7 @@ def _search_database(product: str = "", document_type: str = "", keywords: list 
         resp = genai.embed_content(
             model="models/embedding-001",
             content=query_text,
-            task_type="retrieval_query",
-            output_dimensionality=384
+            task_type="retrieval_query"
         )
         embedding = resp['embedding']
     except Exception as e:
